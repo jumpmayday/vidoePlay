@@ -58,6 +58,7 @@ import com.localplay.app.ui.theme.LocalPlayTypography
 @Composable
 fun SniffScreen(
     onBack: () -> Unit,
+    onOpenPlayer: (path: String) -> Unit = {},
     viewModel: SniffViewModel = viewModel(factory = SniffViewModel.factory())
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -188,7 +189,13 @@ fun SniffScreen(
                         task = task,
                         onPause = { viewModel.pauseTask(task.id) },
                         onResume = { viewModel.resumeTask(task.id) },
-                        onCancel = { viewModel.cancelTask(task.id) }
+                        onRestart = { viewModel.restartTask(task.id) },
+                        onCancel = { viewModel.cancelTask(task.id) },
+                        onPlay = {
+                            viewModel.playWhileDownload(task.id) { path ->
+                                onOpenPlayer(path)
+                            }
+                        }
                     )
                 }
             }
@@ -243,7 +250,9 @@ private fun DownloadTaskRow(
     task: DownloadTaskEntity,
     onPause: () -> Unit,
     onResume: () -> Unit,
-    onCancel: () -> Unit
+    onRestart: () -> Unit,
+    onCancel: () -> Unit,
+    onPlay: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -278,11 +287,18 @@ private fun DownloadTaskRow(
             when (task.status) {
                 DownloadStatus.RUNNING, DownloadStatus.QUEUED -> {
                     TextButton(onClick = onPause) { Text("暂停") }
+                    TextButton(onClick = onPlay) { Text("边下边播", color = LpPrimary) }
+                    TextButton(onClick = onRestart) { Text("重新开始") }
                 }
                 DownloadStatus.PAUSED, DownloadStatus.FAILED -> {
                     TextButton(onClick = onResume) { Text("继续") }
+                    TextButton(onClick = onPlay) { Text("边下边播", color = LpPrimary) }
+                    TextButton(onClick = onRestart) { Text("重新开始") }
                 }
-                DownloadStatus.COMPLETED -> Unit
+                DownloadStatus.COMPLETED -> {
+                    TextButton(onClick = onPlay) { Text("播放", color = LpPrimary) }
+                    TextButton(onClick = onRestart) { Text("重新下载") }
+                }
             }
             if (task.status != DownloadStatus.COMPLETED) {
                 TextButton(onClick = onCancel) { Text("取消", color = LpDanger) }

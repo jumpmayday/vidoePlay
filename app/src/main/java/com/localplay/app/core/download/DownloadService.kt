@@ -17,23 +17,26 @@ import com.localplay.app.R
 import com.localplay.app.core.database.AppDatabase
 import com.localplay.app.core.database.DownloadStatus
 import com.localplay.app.core.database.DownloadTaskEntity
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.util.concurrent.ConcurrentHashMap
 
 class DownloadService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val mutex = Mutex()
+    private val claimMutex = Mutex()
     private var worker: Job? = null
     private val engine by lazy { ResumableDownloadEngine(applicationContext) }
     private val pausedIds = ConcurrentHashMap.newKeySet<Long>()
+    private val activeJobs = ConcurrentHashMap<Long, Job>()
     private val dao by lazy { AppDatabase.get(applicationContext).downloadTaskDao() }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -56,20 +59,62 @@ class DownloadService : Service() {
 
     private fun startQueueWorker() {
         if (worker?.isActive == true) {
-            updateNotification("下载队列运行中", 0, false)
+            updateNotification("下载队列运行中（${activeJobs.size} 个并行）", 0, true)
             return
         }
         startAsForeground("准备下载…", 0)
         worker = scope.launch {
-            mutex.withLock {
+            try {
                 while (isActive) {
-                    val task = dao.nextActive() ?: break
-                    if (task.status == DownloadStatus.PAUSED) break
-                    processTask(task)
+                    activeJobs.entries.removeIf { (_, job) -> !job.isActive }
+
+                    val parallelism = LocalPlayApp.instance.settingsRepository.settings
+                        .first()
+                        .downloadParallelism
+                        .coerceIn(1, 10)
+                    val slots = parallelism - activeJobs.size
+                    if (slots > 0) {
+                        val batch = claimMutex.withLock {
+                            dao.nextQueued(slots).mapNotNull { task ->
+                                if (activeJobs.containsKey(task.id)) return@mapNotNull null
+                                val claimed = task.copy(
+                                    status = DownloadStatus.RUNNING,
+                                    updatedAt = System.currentTimeMillis()
+                                )
+                                dao.update(claimed)
+                                claimed
+                            }
+                        }
+                        batch.forEach { task ->
+                            val job = scope.launch {
+                                try {
+                                    processTask(task)
+                                } finally {
+                                    activeJobs.remove(task.id)
+                                }
+                            }
+                            activeJobs[task.id] = job
+                        }
+                    }
+
+                    val queuedLeft = dao.nextQueued(1)
+                    if (activeJobs.isEmpty() && queuedLeft.isEmpty()) {
+                        break
+                    }
+
+                    val running = activeJobs.size
+                    updateNotification(
+                        if (running > 0) "并行下载中：$running / $parallelism"
+                        else "等待下载任务…",
+                        0,
+                        true
+                    )
+                    delay(400L)
                 }
+            } finally {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
         }
     }
 
@@ -107,7 +152,7 @@ class DownloadService : Service() {
             dao.update(latest)
             updateNotification("下载完成：${latest.title}", 100, false)
             runCatching {
-                LocalPlayApp.instance.videoRepository.refresh(force = true)
+                LocalPlayApp.instance.videoRepository.refreshAfterDownload()
             }
         } catch (e: DownloadAbortedException) {
             val current = dao.getById(task.id) ?: return

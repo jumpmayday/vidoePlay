@@ -66,6 +66,10 @@ class HomeViewModel(
         viewModelScope.launch { repository.refresh(force = true) }
     }
 
+    fun refreshOnLaunch() {
+        viewModelScope.launch { repository.refreshOnLaunch() }
+    }
+
     fun onQueryChange(value: String) {
         extras.update { it.copy(query = value) }
         repository.setQuery(value)

@@ -4,24 +4,36 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.util.Log
 import com.localplay.app.core.database.AppDatabase
 import com.localplay.app.core.database.PlaybackProgressEntity
+import com.localplay.app.core.download.DownloadPlayback
 import com.localplay.app.core.scanner.VideoScanner
 import com.localplay.app.data.model.FolderGroup
 import com.localplay.app.data.model.SortOption
 import com.localplay.app.data.model.VideoItem
+import java.time.LocalDate
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
-class VideoRepository(context: Context) {
+class VideoRepository(
+    context: Context,
+    private val settingsRepository: SettingsRepository
+) {
     private val appContext = context.applicationContext
     private val scanner = VideoScanner(appContext)
-    private val progressDao = AppDatabase.get(appContext).playbackProgressDao()
+    private val db = AppDatabase.get(appContext)
+    private val progressDao = db.playbackProgressDao()
+    private val downloadDao = db.downloadTaskDao()
+    private val refreshMutex = Mutex()
 
-    companion object {
-        private const val TAG = "VideoRepository"
-    }
+    @Volatile
+    private var pendingForceRefresh = false
 
     private val _folders = MutableStateFlow<List<FolderGroup>>(emptyList())
     val folders: StateFlow<List<FolderGroup>> = _folders.asStateFlow()
@@ -36,29 +48,115 @@ class VideoRepository(context: Context) {
     private var sortOption: SortOption = SortOption.DATE_MODIFIED
     private var query: String = ""
 
+    /**
+     * App launch: scan at least once per calendar day (and when cache is empty).
+     */
+    suspend fun refreshOnLaunch() {
+        val today = LocalDate.now().toString()
+        val settings = settingsRepository.settings.first()
+        if (settings.lastScanDay != today || cachedVideos.isEmpty()) {
+            refresh(force = true)
+        }
+    }
+
+    /**
+     * Manual / forced rescan of MediaStore.
+     * Concurrent force requests are queued so the refresh button is never dropped.
+     */
     suspend fun refresh(force: Boolean = false) {
-        if (_scanning.value) return
-        _scanning.value = true
-        try {
-            val progressMap = progressDao.getAll().associateBy { it.path }
-            val scanned = scanner.scan { progress ->
-                _scanProgress.value = progress
+        if (_scanning.value) {
+            if (force) {
+                pendingForceRefresh = true
             }
-            cachedVideos = scanned.map { video ->
-                val progress = progressMap[video.path]
-                if (progress == null) {
-                    video
-                } else {
-                    video.copy(
-                        progressMs = progress.positionMs,
-                        lastPlayedAt = progress.lastPlayedAt
-                    )
+            return
+        }
+        doRefresh()
+        while (pendingForceRefresh) {
+            pendingForceRefresh = false
+            doRefresh()
+        }
+    }
+
+    private suspend fun doRefresh() {
+        refreshMutex.withLock {
+            _scanning.value = true
+            try {
+                val settings = settingsRepository.settings.first()
+                val minSizeBytes = settings.minSizeMb.toLong().coerceAtLeast(0L) * 1024L * 1024L
+                val minDurationMs = settings.minDurationSec.toLong().coerceAtLeast(0L) * 1000L
+                val progressMap = progressDao.getAll().associateBy { it.path }
+                val scanned = scanner.scan(
+                    minSizeBytes = minSizeBytes,
+                    minDurationMs = minDurationMs
+                ) { progress ->
+                    _scanProgress.value = progress
+                }
+                val merged = mergeCompletedDownloads(scanned)
+                cachedVideos = merged.map { video ->
+                    val progress = progressMap[video.path]
+                    if (progress == null) {
+                        video
+                    } else {
+                        video.copy(
+                            progressMs = progress.positionMs,
+                            lastPlayedAt = progress.lastPlayedAt
+                        )
+                    }
+                }
+                rebuildFolders()
+                settingsRepository.setLastScanDay(LocalDate.now().toString())
+                Log.i(TAG, "scan done: ${cachedVideos.size} videos")
+            } catch (e: Exception) {
+                Log.e(TAG, "scan failed", e)
+            } finally {
+                _scanning.value = false
+            }
+        }
+    }
+
+    /**
+     * Force library refresh after a download completes (immediate + delayed for MediaStore probe).
+     */
+    suspend fun refreshAfterDownload() {
+        refresh(force = true)
+        delay(1_500L)
+        refresh(force = true)
+    }
+
+    private suspend fun mergeCompletedDownloads(scanned: List<VideoItem>): List<VideoItem> {
+        val completed = downloadDao.getCompleted()
+        if (completed.isEmpty()) return scanned
+        val existingUris = scanned.map { it.uri }.toHashSet()
+        val existingNames = scanned.map { it.displayName.lowercase() }.toHashSet()
+        val extras = completed.mapNotNull { task ->
+            if (task.outputUri.isBlank()) return@mapNotNull null
+            if (task.outputUri in existingUris) return@mapNotNull null
+            val name = task.title.ifBlank { task.fileName }
+            // Avoid duplicate cards when MediaStore already indexed same file under another URI.
+            if (name.lowercase() in existingNames &&
+                scanned.any { it.folderName.equals("LocalPlay", true) || it.path.contains("/LocalPlay/", true) }
+            ) {
+                // Still skip only exact filename match in LocalPlay.
+                if (scanned.any { it.displayName.equals(task.fileName, true) || it.displayName.equals(name, true) }) {
+                    return@mapNotNull null
                 }
             }
-            rebuildFolders()
-        } finally {
-            _scanning.value = false
+            VideoItem(
+                id = -task.id,
+                uri = task.outputUri,
+                path = DownloadPlayback.pathFor(task.id),
+                displayName = name,
+                folderName = DownloadPlayback.FOLDER_NAME,
+                folderKey = DownloadPlayback.FOLDER_KEY,
+                durationMs = 0L,
+                sizeBytes = task.downloadedBytes.coerceAtLeast(0L),
+                width = 0,
+                height = 0,
+                mimeType = if (task.isHls) "video/mp2t" else "video/mp4",
+                dateModified = task.updatedAt
+            )
         }
+        return scanned + extras
     }
 
     fun setSort(option: SortOption) {
@@ -71,8 +169,36 @@ class VideoRepository(context: Context) {
         rebuildFolders()
     }
 
-
     fun findByPath(path: String): VideoItem? = cachedVideos.firstOrNull { it.path == path }
+
+    /**
+     * Resolve a playable item for library paths or download://{taskId} (边下边播 / 已完成).
+     */
+    suspend fun resolvePlayable(path: String): VideoItem? {
+        val taskId = DownloadPlayback.taskIdFromPath(path)
+        if (taskId != null) {
+            val task = downloadDao.getById(taskId) ?: return findByPath(path)
+            val item = DownloadPlayback.toVideoItem(appContext, task)
+            val progress = progressDao.getAll().firstOrNull { it.path == path }
+            val withProgress = if (progress == null) {
+                item
+            } else {
+                item.copy(progressMs = progress.positionMs, lastPlayedAt = progress.lastPlayedAt)
+            }
+            upsertCached(withProgress)
+            return withProgress
+        }
+        return findByPath(path)
+    }
+
+    fun registerPlayable(item: VideoItem) {
+        upsertCached(item)
+    }
+
+    private fun upsertCached(item: VideoItem) {
+        cachedVideos = listOf(item) + cachedVideos.filterNot { it.path == item.path }
+        rebuildFolders()
+    }
 
     fun findFolder(key: String): FolderGroup? = _folders.value.firstOrNull { it.key == key }
 
@@ -139,16 +265,15 @@ class VideoRepository(context: Context) {
                 cachedVideos = cachedVideos.filterNot { it.path == video.path }
                 rebuildFolders()
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                // Direct delete may require user confirmation via createDeleteRequest.
                 MediaStore.createDeleteRequest(appContext.contentResolver, listOf(uri))
-                android.util.Log.i(TAG, "deleteVideo requires system confirmation: ${video.path}")
+                Log.i(TAG, "deleteVideo requires system confirmation: ${video.path}")
             }
             deleted
         } catch (e: SecurityException) {
-            android.util.Log.w(TAG, "deleteVideo security denied: ${video.path}", e)
+            Log.w(TAG, "deleteVideo security denied: ${video.path}", e)
             false
         } catch (e: Exception) {
-            android.util.Log.e(TAG, "deleteVideo failed: ${video.path}", e)
+            Log.e(TAG, "deleteVideo failed: ${video.path}", e)
             false
         }
     }
@@ -186,5 +311,9 @@ class VideoRepository(context: Context) {
                     videos = videos
                 )
             }
+    }
+
+    companion object {
+        private const val TAG = "VideoRepository"
     }
 }

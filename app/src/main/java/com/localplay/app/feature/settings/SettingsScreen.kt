@@ -41,6 +41,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.localplay.app.LocalPlayApp
 import com.localplay.app.data.repository.AppSettings
 import com.localplay.app.data.repository.ResumeMode
+import com.localplay.app.data.repository.SettingsRepository
 import com.localplay.app.ui.theme.LpBg
 import com.localplay.app.ui.theme.LpOnPrimary
 import com.localplay.app.ui.theme.LpPrimary
@@ -48,6 +49,7 @@ import com.localplay.app.ui.theme.LpSurface
 import com.localplay.app.ui.theme.LpText
 import com.localplay.app.ui.theme.LpText2
 import com.localplay.app.ui.theme.LocalPlayTypography
+import kotlin.math.abs
 import kotlinx.coroutines.launch
 
 @Composable
@@ -104,15 +106,22 @@ fun SettingsScreen(onBack: () -> Unit) {
                     scope.launch { settingsRepo.clearDownloadPath() }
                 }
             }
+            SettingValueRow("并行下载数", settings.downloadParallelism.toString() + " 个") {
+                val next = when (settings.downloadParallelism) {
+                    1 -> 3
+                    3 -> 5
+                    5 -> 8
+                    8 -> 10
+                    else -> 5
+                }
+                scope.launch { settingsRepo.setDownloadParallelism(next) }
+            }
 
             SectionTitle("播放设置")
-            SettingValueRow("默认倍速", settings.defaultSpeed.toString() + "x") {
-                val next = when (settings.defaultSpeed) {
-                    1f -> 1.5f
-                    1.5f -> 2f
-                    2f -> 0.75f
-                    else -> 1f
-                }
+            SettingValueRow("默认倍速", formatSettingSpeed(settings.defaultSpeed)) {
+                val presets = SettingsRepository.SPEED_PRESETS
+                val idx = presets.indexOfFirst { abs(it - settings.defaultSpeed) < 0.01f }
+                val next = presets[(idx + 1).coerceAtLeast(0) % presets.size]
                 scope.launch { settingsRepo.setDefaultSpeed(next) }
             }
             SettingValueRow("快进/快退秒数", settings.seekStepSec.toString() + "s") {
@@ -251,5 +260,13 @@ private fun SettingSwitchRow(label: String, checked: Boolean, onCheckedChange: (
                 uncheckedTrackColor = LpBg
             )
         )
+    }
+}
+
+private fun formatSettingSpeed(speed: Float): String {
+    return if (abs(speed - speed.toInt()) < 0.01f) {
+        speed.toInt().toString() + "x"
+    } else {
+        speed.toString().trimEnd('0').trimEnd('.') + "x"
     }
 }

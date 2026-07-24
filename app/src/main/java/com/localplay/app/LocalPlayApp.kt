@@ -19,8 +19,8 @@ class LocalPlayApp : Application(), ImageLoaderFactory {
     override fun onCreate() {
         super.onCreate()
         instance = this
-        videoRepository = VideoRepository(this)
         settingsRepository = SettingsRepository(this)
+        videoRepository = VideoRepository(this, settingsRepository)
         downloadRepository = DownloadRepository(this)
         // Resume unfinished downloads after process start.
         downloadRepository.startService()

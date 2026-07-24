@@ -12,18 +12,24 @@ interface DownloadTaskDao {
     @Query("SELECT * FROM download_tasks ORDER BY createdAt DESC")
     fun observeAll(): Flow<List<DownloadTaskEntity>>
 
+    @Query("SELECT * FROM download_tasks WHERE status = 'COMPLETED' ORDER BY updatedAt DESC")
+    suspend fun getCompleted(): List<DownloadTaskEntity>
+
     @Query("SELECT * FROM download_tasks WHERE id = :id LIMIT 1")
     suspend fun getById(id: Long): DownloadTaskEntity?
 
     @Query(
         """
         SELECT * FROM download_tasks
-        WHERE status IN ('QUEUED', 'RUNNING')
-        ORDER BY CASE status WHEN 'RUNNING' THEN 0 ELSE 1 END, createdAt ASC
-        LIMIT 1
+        WHERE status = 'QUEUED'
+        ORDER BY createdAt ASC
+        LIMIT :limit
         """
     )
-    suspend fun nextActive(): DownloadTaskEntity?
+    suspend fun nextQueued(limit: Int): List<DownloadTaskEntity>
+
+    @Query("SELECT COUNT(*) FROM download_tasks WHERE status = 'RUNNING'")
+    suspend fun countRunning(): Int
 
     @Query("SELECT COUNT(*) FROM download_tasks WHERE status IN ('QUEUED', 'RUNNING')")
     fun observeActiveCount(): Flow<Int>

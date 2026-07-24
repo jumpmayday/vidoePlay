@@ -70,7 +70,11 @@ class VideoScanner(private val context: Context) {
 
                 val size = cursor.getLong(sizeCol)
                 val duration = cursor.getLong(durationCol)
-                if (size < minSizeBytes || duration < minDurationMs) {
+                if (size < minSizeBytes) {
+                    continue
+                }
+                // Duration may be 0 until MediaStore finishes probing (common for fresh downloads / .ts).
+                if (minDurationMs > 0L && duration > 0L && duration < minDurationMs) {
                     continue
                 }
 

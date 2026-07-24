@@ -168,12 +168,63 @@ class SniffViewModel(
         viewModelScope.launch { downloadRepository.resume(id) }
     }
 
+    fun restartTask(id: Long) {
+        viewModelScope.launch {
+            try {
+                downloadRepository.restart(id)
+                extras.update {
+                    it.copy(successMessage = "已重新开始下载", error = null)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "restart failed", e)
+                extras.update { it.copy(error = e.message ?: "重新开始失败") }
+            }
+        }
+    }
+
     fun cancelTask(id: Long) {
         viewModelScope.launch { downloadRepository.cancel(id) }
     }
 
     fun clearCompleted() {
         viewModelScope.launch { downloadRepository.clearCompleted() }
+    }
+
+    /**
+     * Ensure task is downloading, register playable path, return path for player navigation.
+     */
+    fun playWhileDownload(taskId: Long, onReady: (String) -> Unit) {
+        viewModelScope.launch {
+            try {
+                var task = downloadRepository.getTask(taskId)
+                    ?: run {
+                        extras.update { it.copy(error = "任务不存在") }
+                        return@launch
+                    }
+                when (task.status) {
+                    DownloadStatus.PAUSED, DownloadStatus.FAILED -> downloadRepository.resume(taskId)
+                    DownloadStatus.QUEUED -> downloadRepository.startService()
+                    else -> Unit
+                }
+                task = downloadRepository.getTask(taskId) ?: task
+                val item = com.localplay.app.core.download.DownloadPlayback.toVideoItem(
+                    LocalPlayApp.instance,
+                    task
+                )
+                LocalPlayApp.instance.videoRepository.registerPlayable(item)
+                extras.update {
+                    it.copy(successMessage = "边下边播：下载在后台继续")
+                }
+                onReady(item.path)
+            } catch (e: Exception) {
+                Log.e(TAG, "playWhileDownload failed", e)
+                extras.update { it.copy(error = e.message ?: "无法边下边播") }
+            }
+        }
+    }
+
+    fun playCompleted(taskId: Long, onReady: (String) -> Unit) {
+        playWhileDownload(taskId, onReady)
     }
 
     companion object {

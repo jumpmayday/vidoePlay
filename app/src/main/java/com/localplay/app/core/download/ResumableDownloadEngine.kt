@@ -2,10 +2,13 @@ package com.localplay.app.core.download
 
 import android.content.ContentValues
 import android.content.Context
+import android.media.MediaMetadataRetriever
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import com.localplay.app.core.database.DownloadStatus
 import com.localplay.app.core.database.DownloadTaskEntity
@@ -14,6 +17,8 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.URI
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class DownloadAbortedException : Exception("download aborted")
 
@@ -115,11 +120,11 @@ class ResumableDownloadEngine(
         }
 
         val outputUri = publishFinal(partial, current.fileName, current.treeUri, mimeFor(current))
-        partial.delete()
+        // Keep partial while player may still be reading the growing file; cleaned on restart/cancel.
         return current.copy(
             status = DownloadStatus.COMPLETED,
             outputUri = outputUri.toString(),
-            partialPath = "",
+            partialPath = partial.absolutePath,
             updatedAt = System.currentTimeMillis(),
             errorMessage = ""
         )
@@ -176,11 +181,11 @@ class ResumableDownloadEngine(
         }
 
         val outputUri = publishFinal(partial, current.fileName, current.treeUri, "video/mp2t")
-        partial.delete()
+        // Keep partial for in-flight 边下边播 readers; cleaned on restart/cancel.
         return current.copy(
             status = DownloadStatus.COMPLETED,
             outputUri = outputUri.toString(),
-            partialPath = "",
+            partialPath = partial.absolutePath,
             hlsSegmentIndex = segments.size,
             hlsSegmentTotal = segments.size,
             updatedAt = System.currentTimeMillis(),
@@ -194,19 +199,29 @@ class ResumableDownloadEngine(
         treeUri: String,
         mime: String
     ): Uri {
-        if (treeUri.isNotBlank()) {
-            val tree = DocumentFile.fromTreeUri(context, Uri.parse(treeUri))
-                ?: throw IllegalStateException("下载目录不可用，请在设置中重新选择")
-            tree.findFile(fileName)?.delete()
-            val created = tree.createFile(mime, fileName)
-                ?: throw IllegalStateException("无法在所选目录创建文件")
-            context.contentResolver.openOutputStream(created.uri, "w").use { out ->
-                if (out == null) throw IllegalStateException("无法写入所选目录")
-                FileInputStream(partial).use { input -> input.copyTo(out) }
-            }
-            return created.uri
-        }
+        // Always index into MediaStore so home library can discover the file.
+        val mediaStoreUri = publishToMediaStore(partial, fileName, mime)
 
+        if (treeUri.isNotBlank()) {
+            try {
+                val tree = DocumentFile.fromTreeUri(context, Uri.parse(treeUri))
+                    ?: throw IllegalStateException("下载目录不可用，请在设置中重新选择")
+                tree.findFile(fileName)?.delete()
+                val created = tree.createFile(mime, fileName)
+                    ?: throw IllegalStateException("无法在所选目录创建文件")
+                context.contentResolver.openOutputStream(created.uri, "w").use { out ->
+                    if (out == null) throw IllegalStateException("无法写入所选目录")
+                    FileInputStream(partial).use { input -> input.copyTo(out) }
+                }
+                // Prefer MediaStore URI for library / player consistency.
+            } catch (e: Exception) {
+                Log.w(TAG, "SAF copy failed, keep MediaStore file", e)
+            }
+        }
+        return mediaStoreUri
+    }
+
+    private fun publishToMediaStore(partial: File, fileName: String, mime: String): Uri {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
@@ -215,6 +230,7 @@ class ResumableDownloadEngine(
                     MediaStore.Video.Media.RELATIVE_PATH,
                     Environment.DIRECTORY_MOVIES + "/LocalPlay"
                 )
+                put(MediaStore.Video.Media.SIZE, partial.length())
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             }
             val resolver = context.contentResolver
@@ -224,12 +240,12 @@ class ResumableDownloadEngine(
                 if (out == null) throw IllegalStateException("无法写入媒体库")
                 FileInputStream(partial).use { input -> input.copyTo(out) }
             }
-            resolver.update(
-                uri,
-                ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) },
-                null,
-                null
-            )
+            val meta = ContentValues().apply {
+                put(MediaStore.Video.Media.IS_PENDING, 0)
+                put(MediaStore.Video.Media.SIZE, partial.length())
+                probeDurationMs(uri)?.let { put(MediaStore.Video.Media.DURATION, it) }
+            }
+            resolver.update(uri, meta, null, null)
             return uri
         }
 
@@ -244,7 +260,35 @@ class ResumableDownloadEngine(
         FileInputStream(partial).use { input ->
             FileOutputStream(target).use { output -> input.copyTo(output) }
         }
+        scanFileBlocking(target.absolutePath, mime)
         return Uri.fromFile(target)
+    }
+
+    private fun probeDurationMs(uri: Uri): Long? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+        } catch (e: Exception) {
+            Log.i(TAG, "probe duration failed: ${e.message}")
+            null
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {
+                // ignore
+            }
+        }
+    }
+
+    private fun scanFileBlocking(path: String, mime: String) {
+        val latch = CountDownLatch(1)
+        MediaScannerConnection.scanFile(
+            context,
+            arrayOf(path),
+            arrayOf(mime)
+        ) { _, _ -> latch.countDown() }
+        latch.await(8, TimeUnit.SECONDS)
     }
 
     fun defaultDirPath(): String {
@@ -317,4 +361,7 @@ class ResumableDownloadEngine(
         return name.replace(Regex("""[\\/:*?"<>|]"""), "_").take(80)
     }
 
+    companion object {
+        private const val TAG = "ResumableDownload"
+    }
 }

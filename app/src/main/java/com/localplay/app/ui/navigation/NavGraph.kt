@@ -58,7 +58,12 @@ fun LocalPlayNavHost() {
                 )
             }
             composable(Routes.SNIFF) {
-                SniffScreen(onBack = { navController.popBackStack() })
+                SniffScreen(
+                    onBack = { navController.popBackStack() },
+                    onOpenPlayer = { path ->
+                        navController.navigate(Routes.player(path, fromStart = true))
+                    }
+                )
             }
             composable(
                 route = Routes.FOLDER,

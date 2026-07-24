@@ -22,6 +22,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import com.localplay.app.core.media.ScreenshotSaver
 import com.localplay.app.core.media.VideoClipExporter
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -84,6 +87,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -101,8 +107,6 @@ import com.localplay.app.ui.theme.LpSurface3
 import com.localplay.app.ui.theme.LpText
 import com.localplay.app.ui.theme.LpText2
 import com.localplay.app.ui.theme.LocalPlayTypography
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.roundToInt
@@ -121,27 +125,75 @@ fun PlayerScreen(path: String, fromStart: Boolean, onBack: () -> Unit) {
     val context = LocalContext.current
     val activity = context as? Activity
     val repository = LocalPlayApp.instance.videoRepository
+    val settingsRepository = LocalPlayApp.instance.settingsRepository
     val scope = rememberCoroutineScope()
-    val video = remember(path) { repository.findByPath(path) }
     val density = LocalDensity.current
     val touchSlopPx = with(density) { 18.dp.toPx() }
 
-    if (video == null) {
+    var video by remember(path) { mutableStateOf<VideoItem?>(null) }
+    var resolveFailed by remember(path) { mutableStateOf(false) }
+
+    LaunchedEffect(path) {
+        resolveFailed = false
+        video = repository.resolvePlayable(path)
+        if (video == null) resolveFailed = true
+    }
+
+    if (resolveFailed) {
         MissingVideoScreen()
         return
     }
+    val resolved = video
+    if (resolved == null) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("加载中…", color = LpText2)
+        }
+        return
+    }
 
+    PlayerScreenContent(
+        initialVideo = resolved,
+        path = path,
+        fromStart = fromStart,
+        onBack = onBack,
+        context = context,
+        activity = activity,
+        repository = repository,
+        settingsRepository = settingsRepository,
+        scope = scope,
+        touchSlopPx = touchSlopPx
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PlayerScreenContent(
+    initialVideo: VideoItem,
+    path: String,
+    fromStart: Boolean,
+    onBack: () -> Unit,
+    context: Context,
+    activity: Activity?,
+    repository: com.localplay.app.data.repository.VideoRepository,
+    settingsRepository: com.localplay.app.data.repository.SettingsRepository,
+    scope: kotlinx.coroutines.CoroutineScope,
+    touchSlopPx: Float
+) {
+    val video = initialVideo
     var controlsVisible by remember { mutableStateOf(true) }
     var locked by remember { mutableStateOf(false) }
     var isPlaying by remember { mutableStateOf(true) }
     var positionMs by remember { mutableLongStateOf(0L) }
-    var durationMs by remember { mutableLongStateOf(video.durationMs) }
+    var durationMs by remember { mutableLongStateOf(initialVideo.durationMs) }
     var speed by remember { mutableFloatStateOf(1f) }
     var showSpeedSheet by remember { mutableStateOf(false) }
     var brightnessHint by remember { mutableStateOf<Int?>(null) }
     var volumeHint by remember { mutableStateOf<Int?>(null) }
     var seekHint by remember { mutableStateOf<String?>(null) }
-    var currentVideo by remember { mutableStateOf(video) }
+    var currentVideo by remember { mutableStateOf(initialVideo) }
     var lastTapAt by remember { mutableLongStateOf(0L) }
     var lastTapX by remember { mutableFloatStateOf(0f) }
     var lastTapY by remember { mutableFloatStateOf(0f) }
@@ -166,14 +218,74 @@ fun PlayerScreen(path: String, fromStart: Boolean, onBack: () -> Unit) {
         mutableStateOf(siblings.indexOfFirst { it.path == path }.coerceAtLeast(0))
     }
 
-    val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(video.uri))
-            playWhenReady = true
-            prepare()
-            val start = if (fromStart) 0L else video.progressMs
-            if (start > 0L) seekTo(start)
+    val downloadFinished = remember(path) { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val growingFile = remember(path, initialVideo.uri) {
+        com.localplay.app.core.download.DownloadPlayback.growingFileFor(path)
+    }
+
+    val exoPlayer = remember(initialVideo.uri, growingFile?.absolutePath) {
+        val referer = com.localplay.app.core.download.DownloadPlayback.refererForPath(path)
+        val httpFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
+            .setUserAgent(
+                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"
+            )
+            .setAllowCrossProtocolRedirects(true)
+        if (!referer.isNullOrBlank()) {
+            httpFactory.setDefaultRequestProperties(
+                mapOf(
+                    "Referer" to referer,
+                    "Accept" to "*/*"
+                )
+            )
         }
+        val httpDataSourceFactory =
+            androidx.media3.datasource.DefaultDataSource.Factory(context, httpFactory)
+        val dataSourceFactory = if (growingFile != null && growingFile.exists()) {
+            com.localplay.app.core.download.GrowingFileDataSource.Factory(growingFile, downloadFinished)
+        } else {
+            httpDataSourceFactory
+        }
+        val mediaSourceFactory =
+            androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSourceFactory)
+        val playUri = if (growingFile != null && growingFile.exists()) {
+            android.net.Uri.fromFile(growingFile)
+        } else {
+            android.net.Uri.parse(initialVideo.uri)
+        }
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build()
+            .apply {
+                setMediaItem(MediaItem.fromUri(playUri))
+                playWhenReady = true
+                prepare()
+                val startPos = if (fromStart) 0L else initialVideo.progressMs
+                if (startPos > 0L) seekTo(startPos)
+            }
+    }
+
+    LaunchedEffect(path) {
+        val taskId = com.localplay.app.core.download.DownloadPlayback.taskIdFromPath(path)
+        if (taskId != null) {
+            val downloadRepo = LocalPlayApp.instance.downloadRepository
+            while (true) {
+                val task = downloadRepo.getTask(taskId)
+                val done = task == null ||
+                    task.status == com.localplay.app.core.database.DownloadStatus.COMPLETED ||
+                    task.status == com.localplay.app.core.database.DownloadStatus.FAILED
+                downloadFinished.set(done)
+                if (done) break
+                delay(400L)
+            }
+        } else {
+            downloadFinished.set(true)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        val defaultSpeed = settingsRepository.settings.first().defaultSpeed.coerceIn(0.25f, 5f)
+        speed = defaultSpeed
+        exoPlayer.setPlaybackSpeed(defaultSpeed)
     }
 
     val latestVideo by rememberUpdatedState(currentVideo)
@@ -192,6 +304,33 @@ fun PlayerScreen(path: String, fromStart: Boolean, onBack: () -> Unit) {
                 modifiedAt = latestVideo.dateModified,
                 speed = latestSpeed
             )
+        }
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, exoPlayer) {
+        var resumeWhenVisible = false
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> {
+                    resumeWhenVisible = exoPlayer.playWhenReady
+                    if (resumeWhenVisible) {
+                        exoPlayer.pause()
+                    }
+                    persistProgress()
+                }
+                Lifecycle.Event.ON_RESUME -> {
+                    if (resumeWhenVisible) {
+                        exoPlayer.play()
+                        resumeWhenVisible = false
+                    }
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
 
@@ -686,6 +825,9 @@ fun PlayerScreen(path: String, fromStart: Boolean, onBack: () -> Unit) {
                     speed = it
                     exoPlayer.setPlaybackSpeed(it)
                     showSpeedSheet = false
+                    scope.launch {
+                        settingsRepository.setDefaultSpeed(it)
+                    }
                 })
             }
         }

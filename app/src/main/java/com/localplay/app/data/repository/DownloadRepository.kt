@@ -68,6 +68,15 @@ class DownloadRepository(context: Context) {
                     updatedAt = System.currentTimeMillis()
                 )
             )
+            val intent = Intent(appContext, DownloadService::class.java).apply {
+                action = DownloadService.ACTION_PAUSE
+                putExtra(DownloadService.EXTRA_TASK_ID, id)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                appContext.startForegroundService(intent)
+            } else {
+                appContext.startService(intent)
+            }
         }
     }
 
@@ -85,6 +94,38 @@ class DownloadRepository(context: Context) {
         }
     }
 
+    /**
+     * Discard partial progress and enqueue from the beginning.
+     */
+    suspend fun restart(id: Long) {
+        val task = dao.getById(id) ?: return
+        if (task.status == DownloadStatus.RUNNING || task.status == DownloadStatus.QUEUED) {
+            pause(id)
+        }
+        if (task.partialPath.isNotBlank()) {
+            runCatching { java.io.File(task.partialPath).delete() }
+        }
+        // Also clear any leftover part file by id pattern.
+        runCatching {
+            val dir = java.io.File(appContext.filesDir, "download_partials")
+            dir.listFiles()?.filter { it.name.startsWith("${id}_") }?.forEach { it.delete() }
+        }
+        dao.update(
+            task.copy(
+                status = DownloadStatus.QUEUED,
+                downloadedBytes = 0L,
+                totalBytes = -1L,
+                hlsSegmentIndex = 0,
+                hlsSegmentTotal = 0,
+                partialPath = "",
+                outputUri = "",
+                errorMessage = "",
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+        startService()
+    }
+
     suspend fun cancel(id: Long) {
         val task = dao.getById(id) ?: return
         if (task.partialPath.isNotBlank()) {
@@ -94,8 +135,16 @@ class DownloadRepository(context: Context) {
     }
 
     suspend fun clearCompleted() {
+        val completed = dao.getCompleted()
+        completed.forEach { task ->
+            if (task.partialPath.isNotBlank()) {
+                runCatching { java.io.File(task.partialPath).delete() }
+            }
+        }
         dao.clearCompleted()
     }
+
+    suspend fun getTask(id: Long): DownloadTaskEntity? = dao.getById(id)
 
     fun startService() {
         val intent = Intent(appContext, DownloadService::class.java).apply {

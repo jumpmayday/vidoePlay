@@ -87,7 +87,7 @@ fun HomeScreen(
     var sortMenuExpanded by remember { mutableStateOf(false) }
     var moreMenuExpanded by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) { viewModel.refresh() }
+    LaunchedEffect(Unit) { viewModel.refreshOnLaunch() }
 
     Column(
         modifier = Modifier
@@ -133,29 +133,40 @@ fun HomeScreen(
             }
             state.folders.isEmpty() -> EmptyLibraryPlaceholder()
             else -> {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    items(state.folders, key = { it.key }) { folder ->
-                        FolderRow(
-                            folder = folder,
-                            selectionMode = state.selectionMode,
-                            selected = folder.key in state.selectedKeys,
-                            onClick = {
-                                if (state.selectionMode) {
-                                    viewModel.toggleSelected(folder.key)
-                                } else {
-                                    onOpenFolder(folder.key)
-                                }
-                            },
-                            onLongClick = {
-                                if (!state.selectionMode) {
-                                    viewModel.enterSelectionMode(folder.key)
-                                }
-                            },
-                            onToggleSelect = { viewModel.toggleSelected(folder.key) }
+                Box(modifier = Modifier.fillMaxSize()) {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(vertical = 8.dp, horizontal = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        items(state.folders, key = { it.key }) { folder ->
+                            FolderRow(
+                                folder = folder,
+                                selectionMode = state.selectionMode,
+                                selected = folder.key in state.selectedKeys,
+                                onClick = {
+                                    if (state.selectionMode) {
+                                        viewModel.toggleSelected(folder.key)
+                                    } else {
+                                        onOpenFolder(folder.key)
+                                    }
+                                },
+                                onLongClick = {
+                                    if (!state.selectionMode) {
+                                        viewModel.enterSelectionMode(folder.key)
+                                    }
+                                },
+                                onToggleSelect = { viewModel.toggleSelected(folder.key) }
+                            )
+                        }
+                    }
+                    if (state.scanning) {
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .align(Alignment.TopCenter),
+                            color = LpPrimary,
+                            trackColor = LpSurface3
                         )
                     }
                 }
