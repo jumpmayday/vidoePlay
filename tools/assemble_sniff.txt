@@ -1,0 +1,60 @@
+To honour the JVM settings for this build a single-use Daemon process will be forked. For more on this, please refer to https://docs.gradle.org/8.9/userguide/gradle_daemon.html#sec:disabling_the_daemon in the Gradle documentation.
+Daemon will be stopped at the end of the build 
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preDebugBuild UP-TO-DATE
+> Task :app:mergeDebugNativeDebugMetadata NO-SOURCE
+> Task :app:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :app:checkDebugAarMetadata UP-TO-DATE
+> Task :app:generateDebugResValues UP-TO-DATE
+> Task :app:mapDebugSourceSetPaths UP-TO-DATE
+> Task :app:generateDebugResources UP-TO-DATE
+> Task :app:mergeDebugResources UP-TO-DATE
+> Task :app:packageDebugResources UP-TO-DATE
+> Task :app:parseDebugLocalResources UP-TO-DATE
+> Task :app:createDebugCompatibleScreenManifests UP-TO-DATE
+> Task :app:extractDeepLinksDebug UP-TO-DATE
+> Task :app:processDebugMainManifest
+> Task :app:processDebugManifest
+> Task :app:javaPreCompileDebug UP-TO-DATE
+> Task :app:mergeDebugShaders UP-TO-DATE
+> Task :app:compileDebugShaders NO-SOURCE
+> Task :app:generateDebugAssets UP-TO-DATE
+> Task :app:mergeDebugAssets UP-TO-DATE
+> Task :app:compressDebugAssets UP-TO-DATE
+> Task :app:desugarDebugFileDependencies UP-TO-DATE
+> Task :app:mergeDebugJniLibFolders UP-TO-DATE
+> Task :app:mergeDebugNativeLibs UP-TO-DATE
+> Task :app:stripDebugDebugSymbols UP-TO-DATE
+> Task :app:validateSigningDebug UP-TO-DATE
+> Task :app:writeDebugAppMetadata UP-TO-DATE
+> Task :app:writeDebugSigningConfigVersions UP-TO-DATE
+> Task :app:processDebugManifestForPackage
+> Task :app:checkDebugDuplicateClasses
+> Task :app:processDebugResources
+> Task :app:mergeLibDexDebug UP-TO-DATE
+> Task :app:mergeExtDexDebug
+> Task :app:kspDebugKotlin
+
+> Task :app:compileDebugKotlin
+w: file:///D:/code/stu/videoPlay/app/src/main/java/com/localplay/app/core/sniff/ChallengedHttpClient.kt:41:46 Java type mismatch: inferred type is 'kotlin.String?', but 'kotlin.String' was expected.
+w: file:///D:/code/stu/videoPlay/app/src/main/java/com/localplay/app/core/sniff/VideoSniffer.kt:110:35 Java type mismatch: inferred type is 'kotlin.String?', but 'kotlin.String' was expected.
+w: file:///D:/code/stu/videoPlay/app/src/main/java/com/localplay/app/core/sniff/VideoSniffer.kt:154:45 Java type mismatch: inferred type is 'kotlin.String?', but 'kotlin.String' was expected.
+w: file:///D:/code/stu/videoPlay/app/src/main/java/com/localplay/app/core/sniff/VideoSniffer.kt:173:44 Java type mismatch: inferred type is 'kotlin.String?', but 'kotlin.String' was expected.
+w: file:///D:/code/stu/videoPlay/app/src/main/java/com/localplay/app/core/sniff/VideoSniffer.kt:174:35 Java type mismatch: inferred type is 'kotlin.String?', but 'kotlin.String' was expected.
+w: file:///D:/code/stu/videoPlay/app/src/main/java/com/localplay/app/core/sniff/VideoSniffer.kt:181:44 Java type mismatch: inferred type is 'kotlin.String?', but 'kotlin.String' was expected.
+w: file:///D:/code/stu/videoPlay/app/src/main/java/com/localplay/app/core/sniff/VideoSniffer.kt:191:43 Java type mismatch: inferred type is 'kotlin.String?', but 'kotlin.String' was expected.
+w: file:///D:/code/stu/videoPlay/app/src/main/java/com/localplay/app/core/sniff/VideoSniffer.kt:213:26 Java type mismatch: inferred type is 'kotlin.String?', but 'kotlin.String' was expected.
+w: file:///D:/code/stu/videoPlay/app/src/main/java/com/localplay/app/feature/home/HomeScreen.kt:226:43 'val Icons.Filled.Sort: ImageVector' is deprecated. Use the AutoMirrored version at Icons.AutoMirrored.Filled.Sort.
+
+> Task :app:compileDebugJavaWithJavac UP-TO-DATE
+> Task :app:dexBuilderDebug
+> Task :app:mergeDebugGlobalSynthetics UP-TO-DATE
+> Task :app:processDebugJavaRes
+> Task :app:mergeProjectDexDebug
+> Task :app:mergeDebugJavaResource
+> Task :app:packageDebug
+> Task :app:createDebugApkListingFileRedirect UP-TO-DATE
+> Task :app:assembleDebug
+
+BUILD SUCCESSFUL in 1m 45s
+37 actionable tasks: 13 executed, 24 up-to-date

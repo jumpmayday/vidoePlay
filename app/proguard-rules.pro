@@ -1,0 +1,2 @@
+# LocalPlay
+-keepattributes *Annotation*
