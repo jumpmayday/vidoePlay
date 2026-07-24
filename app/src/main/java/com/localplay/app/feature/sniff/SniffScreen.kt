@@ -362,6 +362,7 @@ private fun SniffItemRow(
                 buildString {
                     append(if (item.isHls) "HLS" else "文件")
                     if (item.sourceLabel.isNotBlank()) append(" · ").append(item.sourceLabel)
+                    if (item.episodeLabel.isNotBlank()) append(" · ").append(item.episodeLabel)
                 },
                 style = LocalPlayTypography.labelSmall,
                 color = LpText2

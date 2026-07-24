@@ -4,17 +4,27 @@ data class SniffedVideo(
     val title: String,
     val pageUrl: String,
     val mediaUrl: String,
-    val sourceLabel: String = ""
+    val sourceLabel: String = "",
+    /** Normalized episode tag such as 第01集; empty for movies / single files. */
+    val episodeLabel: String = ""
 ) {
     val isHls: Boolean
         get() = mediaUrl.contains(".m3u8", ignoreCase = true)
 
     val suggestedFileName: String
         get() {
-            val safe = title
+            val base = title
                 .replace(Regex("""[\\/:*?"<>|]"""), "_")
+                .replace(Regex("""\s+"""), " ")
                 .trim()
                 .ifBlank { "video_${System.currentTimeMillis()}" }
+            // Ensure episode appears in filename when known (helps TV downloads).
+            val withEp = if (episodeLabel.isNotBlank() && !base.contains(episodeLabel)) {
+                "${base}_$episodeLabel"
+            } else {
+                base
+            }
+            val safe = withEp.replace(' ', '_').take(120)
             val ext = when {
                 isHls -> "ts"
                 mediaUrl.contains(".webm", true) -> "webm"

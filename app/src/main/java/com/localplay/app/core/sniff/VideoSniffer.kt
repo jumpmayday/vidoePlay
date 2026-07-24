@@ -8,6 +8,9 @@ import java.net.URI
 import java.net.URLDecoder
 import java.util.LinkedHashMap
 import java.util.LinkedHashSet
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.regex.Pattern
 
 class VideoSniffer(
@@ -63,19 +66,39 @@ class VideoSniffer(
         val fromPlayer = extractFromPlayerJson(html, normalized)
         if (fromPlayer.isNotEmpty()) return fromPlayer
 
-        // Detail pages: prefer play-page m3u8 over loose .mp4 strings in HTML.
+        val showTitle = extractShowTitle(html).ifBlank { extractTitle(html) }
+
+        // Thunder / direct episode downloads on detail pages (often already episode-labeled).
+        val thunder = extractThunderEpisodes(html, normalized, showTitle)
+        if (thunder.isNotEmpty()) {
+            onStatus("校验迅雷分集直链…")
+            val verified = verifyVideosParallel(thunder, onStatus)
+            if (verified.isNotEmpty()) {
+                onStatus("迅雷直链可用 ${verified.size} 集")
+                return verified.sortedWith(compareBy({ episodeSortKey(it.episodeLabel) }, { it.title }))
+            }
+        }
+
+        // TV / multi-source playlists: pick one reachable线路, keep all episodes.
+        val seriesEps = extractPlayEpisodes(html, normalized)
+        if (seriesEps.isNotEmpty()) {
+            onStatus("发现 ${seriesEps.groupBy { it.sourceIndex }.size} 条线路，正在筛选可用源…")
+            val series = resolveBestSeriesSource(seriesEps, showTitle, onStatus)
+            if (series.isNotEmpty()) return series
+        }
+
         val playLinks = extractPlayLinks(html, normalized)
         if (playLinks.isNotEmpty()) {
-            onStatus("发现 ${playLinks.size} 个播放源…")
+            onStatus("发现 ${playLinks.size} 个播放页…")
             val fromPlay = resolvePlayPages(
-                playLinks = playLinks.distinct().take(8),
-                titleHint = extractTitle(html),
+                playLinks = playLinks.distinct().take(6),
+                titleHint = showTitle,
                 onStatus = onStatus
             )
             if (fromPlay.isNotEmpty()) return fromPlay
         }
 
-        val direct = extractDirectMediaUrls(html, normalized)
+        val direct = extractDirectMediaUrls(html, normalized, showTitle)
         if (direct.isNotEmpty()) return direct
 
         val details = extractDetailLinks(html, normalized)
@@ -200,8 +223,11 @@ class VideoSniffer(
                     }
                 }
                 if (result.isNotEmpty()) {
-                    onStatus("接口解析到 ${result.size} 个地址")
-                    return result.values.toList()
+                    onStatus("接口解析到 ${result.size} 个地址，正在校验…")
+                    val verified = verifyVideosParallel(result.values.toList(), onStatus)
+                    val series = preferOneSourcePerEpisode(verified)
+                    if (series.isNotEmpty()) return series
+                    if (verified.isNotEmpty()) return verified
                 }
             } catch (e: Exception) {
                 Log.i(TAG, "detail api failed: $endpoint (${e.message})")
@@ -228,17 +254,19 @@ class VideoSniffer(
                 val epName = parts.first().trim()
                 val media = parts.last().trim().replace("\\/", "/")
                 if (!isDirectMedia(media) && !media.startsWith("http")) return@forEach
-                val fullTitle = buildString {
-                    append(title.ifBlank { "视频" })
-                    if (epName.isNotBlank() && epName != title) append(" - ").append(epName)
-                }
+                val episodeLabel = normalizeEpisodeLabel(epName)
+                val fullTitle = buildEpisodeTitle(
+                    showTitle = title.ifBlank { "视频" },
+                    episodeLabel = episodeLabel.ifBlank { epName }
+                )
                 result.putIfAbsent(
                     media,
                     SniffedVideo(
                         title = fullTitle,
                         pageUrl = pageUrl,
                         mediaUrl = media,
-                        sourceLabel = "线路${sourceIndex + 1}"
+                        sourceLabel = "线路${sourceIndex + 1}",
+                        episodeLabel = episodeLabel
                     )
                 )
             }
@@ -283,28 +311,292 @@ class VideoSniffer(
         titleHint: String,
         onStatus: (String) -> Unit
     ): List<SniffedVideo> {
-        val result = LinkedHashMap<String, SniffedVideo>()
-        playLinks.forEachIndexed { index, playUrl ->
-            onStatus("读取播放源 ${index + 1}/${playLinks.size}")
+        val done = AtomicInteger(0)
+        val total = playLinks.size
+        val collected = mapParallel(playLinks) { playUrl ->
+            val n = done.incrementAndGet()
+            onStatus("读取播放源 $n/$total")
             try {
                 val html = http.getHtml(playUrl)
-                extractFromPlayerJson(html, playUrl, titleHint).forEach {
-                    result.putIfAbsent(it.mediaUrl, it)
-                }
-                extractDirectMediaUrls(html, playUrl, titleHint).forEach {
-                    result.putIfAbsent(it.mediaUrl, it)
-                }
+                extractFromPlayerJson(html, playUrl, titleHint) +
+                    extractDirectMediaUrls(html, playUrl, titleHint)
             } catch (e: Exception) {
                 Log.w(TAG, "resolve play failed: $playUrl", e)
+                emptyList()
+            }
+        }.flatten()
+        return verifyVideosParallel(collected, onStatus)
+    }
+
+    private data class PlayEpisode(
+        val sourceIndex: Int,
+        val sourceId: Int,
+        val sourceName: String,
+        val preferred: Boolean,
+        val episodeId: Int,
+        val episodeLabel: String,
+        val playUrl: String
+    )
+
+    /**
+     * Parse `#play` tabs + `#playlist .videolist` pairs (huanyuxing / similar MacCMS skins).
+     */
+    private fun extractPlayEpisodes(html: String, pageUrl: String): List<PlayEpisode> {
+        val tabHtml = matchGroup(PLAY_UL, html) ?: return emptyList()
+        val sourceNames = mutableListOf<Pair<String, Boolean>>()
+        val li = PLAY_LI.matcher(tabHtml)
+        while (li.find()) {
+            val attrs = li.group(1).orEmpty()
+            val preferred = attrs.contains("this", ignoreCase = true)
+            val name = cleanText(li.group(2).orEmpty()).ifBlank { "线路${sourceNames.size + 1}" }
+            sourceNames += name to preferred
+        }
+        if (sourceNames.isEmpty()) return emptyList()
+
+        val lists = mutableListOf<String>()
+        val listMatcher = VIDEO_LIST.matcher(html)
+        while (listMatcher.find()) {
+            lists += listMatcher.group(1).orEmpty()
+        }
+        if (lists.isEmpty()) return emptyList()
+
+        val result = ArrayList<PlayEpisode>()
+        val count = minOf(sourceNames.size, lists.size)
+        for (index in 0 until count) {
+            val (sourceName, preferred) = sourceNames[index]
+            val anchor = PLAY_EP_ANCHOR.matcher(lists[index])
+            while (anchor.find()) {
+                val href = absolutize(pageUrl, anchor.group(1).orEmpty())
+                val sourceId = anchor.group(3)?.toIntOrNull() ?: (index + 1)
+                val episodeId = anchor.group(4)?.toIntOrNull() ?: continue
+                val titleAttr = cleanText(anchor.group(5).orEmpty())
+                val inner = cleanText(anchor.group(6).orEmpty())
+                val episodeLabel = normalizeEpisodeLabel(inner.ifBlank { titleAttr })
+                    .ifBlank { "第${episodeId.toString().padStart(2, '0')}集" }
+                result += PlayEpisode(
+                    sourceIndex = index,
+                    sourceId = sourceId,
+                    sourceName = sourceName,
+                    preferred = preferred,
+                    episodeId = episodeId,
+                    episodeLabel = episodeLabel,
+                    playUrl = href
+                )
             }
         }
+        return result.distinctBy { "${it.sourceIndex}-${it.episodeId}-${it.playUrl}" }
+    }
+
+    private fun extractThunderEpisodes(
+        html: String,
+        pageUrl: String,
+        showTitle: String
+    ): List<SniffedVideo> {
+        val block = matchGroup(DOWN_LIST, html) ?: html
+        val result = LinkedHashMap<String, SniffedVideo>()
+        val matcher = THUNDER_EP.matcher(block)
+        while (matcher.find()) {
+            val epRaw = cleanText(matcher.group(1).orEmpty())
+            val media = absolutize(pageUrl, matcher.group(2).orEmpty().replace("\\/", "/"))
+            if (!isDirectMedia(media)) continue
+            val episodeLabel = normalizeEpisodeLabel(epRaw)
+                .ifBlank { guessEpisodeFromUrl(media) }
+            result.putIfAbsent(
+                media,
+                SniffedVideo(
+                    title = buildEpisodeTitle(showTitle, episodeLabel),
+                    pageUrl = pageUrl,
+                    mediaUrl = media,
+                    sourceLabel = "迅雷下载",
+                    episodeLabel = episodeLabel
+                )
+            )
+        }
         return result.values.toList()
+    }
+
+    private fun resolveBestSeriesSource(
+        episodes: List<PlayEpisode>,
+        showTitle: String,
+        onStatus: (String) -> Unit
+    ): List<SniffedVideo> {
+        val bySource = episodes.groupBy { it.sourceIndex }
+            .toSortedMap()
+        if (bySource.isEmpty()) return emptyList()
+
+        data class Probe(
+            val sourceIndex: Int,
+            val sourceName: String,
+            val preferred: Boolean,
+            val sample: PlayEpisode,
+            val mediaUrl: String,
+            val from: String,
+            val ok: Boolean
+        )
+
+        // Probe first episode of each source in parallel.
+        val probes = mapParallel(bySource.entries.toList()) { (index, eps) ->
+            val sample = eps.minByOrNull { it.episodeId } ?: return@mapParallel null
+            try {
+                val playHtml = http.getHtml(sample.playUrl)
+                val parsed = extractPlayerMedia(playHtml) ?: return@mapParallel Probe(
+                    sourceIndex = index,
+                    sourceName = sample.sourceName,
+                    preferred = sample.preferred,
+                    sample = sample,
+                    mediaUrl = "",
+                    from = "",
+                    ok = false
+                )
+                val ok = http.probeMediaOk(parsed.first, sample.playUrl)
+                Probe(
+                    sourceIndex = index,
+                    sourceName = sample.sourceName,
+                    preferred = sample.preferred,
+                    sample = sample,
+                    mediaUrl = parsed.first,
+                    from = parsed.second,
+                    ok = ok
+                )
+            } catch (e: Exception) {
+                Log.i(TAG, "probe source ${sample.sourceName} failed: ${e.message}")
+                Probe(
+                    sourceIndex = index,
+                    sourceName = sample.sourceName,
+                    preferred = sample.preferred,
+                    sample = sample,
+                    mediaUrl = "",
+                    from = "",
+                    ok = false
+                )
+            }
+        }.filterNotNull()
+
+        val good = probes.filter { it.ok }
+        if (good.isEmpty()) {
+            onStatus("播放线路暂不可用")
+            return emptyList()
+        }
+
+        val best = good.firstOrNull { it.preferred }
+            ?: good.maxByOrNull { scoreSource(it.from, it.mediaUrl) }
+            ?: good.first()
+
+        onStatus("选用线路「${best.sourceName}」，解析分集…")
+        val selectedEps = bySource[best.sourceIndex]
+            ?.sortedBy { it.episodeId }
+            .orEmpty()
+        if (selectedEps.isEmpty()) return emptyList()
+
+        val done = AtomicInteger(0)
+        val total = selectedEps.size
+        val videos = mapParallel(selectedEps) { ep ->
+            val n = done.incrementAndGet()
+            onStatus("解析 ${best.sourceName} $n/$total · ${ep.episodeLabel}")
+            try {
+                val playHtml = http.getHtml(ep.playUrl)
+                val media = extractPlayerMedia(playHtml)?.first
+                    ?: return@mapParallel null
+                if (!http.probeMediaOk(media, ep.playUrl)) return@mapParallel null
+                SniffedVideo(
+                    title = buildEpisodeTitle(showTitle, ep.episodeLabel),
+                    pageUrl = ep.playUrl,
+                    mediaUrl = media,
+                    sourceLabel = best.sourceName,
+                    episodeLabel = ep.episodeLabel
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "episode resolve failed: ${ep.playUrl}", e)
+                null
+            }
+        }.filterNotNull()
+
+        return videos.sortedWith(compareBy({ episodeSortKey(it.episodeLabel) }, { it.title }))
+    }
+
+    private fun extractPlayerMedia(html: String): Pair<String, String>? {
+        val matcher = PLAYER_JSON.matcher(html)
+        if (!matcher.find()) return null
+        return try {
+            val json = JSONObject(matcher.group(1))
+            val encrypt = json.optInt("encrypt", 0)
+            val media = decodePlayerUrl(encrypt, json.optString("url"))
+            if (media.isBlank() || (!isDirectMedia(media) && !media.startsWith("http"))) {
+                null
+            } else {
+                media to json.optString("from")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "extract player media failed", e)
+            null
+        }
+    }
+
+    private fun verifyVideosParallel(
+        videos: List<SniffedVideo>,
+        onStatus: (String) -> Unit
+    ): List<SniffedVideo> {
+        if (videos.isEmpty()) return emptyList()
+        if (videos.size == 1) {
+            return if (http.probeMediaOk(videos[0].mediaUrl, videos[0].pageUrl)) videos else emptyList()
+        }
+        val done = AtomicInteger(0)
+        val total = videos.size
+        return mapParallel(videos) { video ->
+            val n = done.incrementAndGet()
+            if (n == 1 || n == total || n % 3 == 0) {
+                onStatus("校验媒体 $n/$total")
+            }
+            if (http.probeMediaOk(video.mediaUrl, video.pageUrl)) video else null
+        }.filterNotNull()
+    }
+
+    /** Keep one working media per episode (prefer higher score source labels). */
+    private fun preferOneSourcePerEpisode(videos: List<SniffedVideo>): List<SniffedVideo> {
+        if (videos.isEmpty()) return emptyList()
+        val grouped = videos.groupBy {
+            it.episodeLabel.ifBlank { it.title }
+        }
+        if (grouped.size <= 1 && videos.size <= 2) return videos
+        return grouped.values.map { group ->
+            group.maxByOrNull { scoreSource(it.sourceLabel, it.mediaUrl) } ?: group.first()
+        }.sortedWith(compareBy({ episodeSortKey(it.episodeLabel) }, { it.title }))
+    }
+
+    private fun scoreSource(from: String, mediaUrl: String): Int {
+        var score = 0
+        val f = from.lowercase()
+        val u = mediaUrl.lowercase()
+        if (f.contains("1080") || u.contains("1080")) score += 30
+        if (f.contains("zy") || f.contains("zuida") || f.contains("wj") || f.contains("ff")) score += 10
+        if (u.contains(".m3u8")) score += 5
+        if (u.contains("404") || f.contains("bfzy") || f.contains("lz")) score -= 5
+        return score
+    }
+
+    private fun <T, R> mapParallel(
+        items: List<T>,
+        parallelism: Int = SNIFF_PARALLEL,
+        block: (T) -> R
+    ): List<R> {
+        if (items.isEmpty()) return emptyList()
+        if (items.size == 1) return listOf(block(items.first()))
+        val pool = Executors.newFixedThreadPool(parallelism.coerceAtMost(items.size).coerceAtLeast(1))
+        return try {
+            val futures = items.map { item ->
+                pool.submit<R> { block(item) }
+            }
+            futures.map { it.get(45, TimeUnit.SECONDS) }
+        } finally {
+            pool.shutdownNow()
+        }
     }
 
     private fun extractFromPlayerJson(
         html: String,
         pageUrl: String,
-        titleHint: String = ""
+        titleHint: String = "",
+        episodeLabel: String = ""
     ): List<SniffedVideo> {
         val matcher = PLAYER_JSON.matcher(html)
         if (!matcher.find()) return emptyList()
@@ -316,12 +608,15 @@ class VideoSniffer(
                 emptyList()
             } else {
                 val vodName = json.optJSONObject("vod_data")?.optString("vod_name").orEmpty()
+                val show = vodName.ifBlank { titleHint.ifBlank { extractTitle(html) } }
+                val ep = episodeLabel.ifBlank { guessEpisodeFromUrl(media) }
                 listOf(
                     SniffedVideo(
-                        title = vodName.ifBlank { titleHint.ifBlank { extractTitle(html) } },
+                        title = buildEpisodeTitle(show, ep),
                         pageUrl = pageUrl,
                         mediaUrl = media,
-                        sourceLabel = json.optString("from").ifBlank { "播放器" }
+                        sourceLabel = json.optString("from").ifBlank { "播放器" },
+                        episodeLabel = ep
                     )
                 )
             }
@@ -503,6 +798,60 @@ class VideoSniffer(
             .trim()
     }
 
+    private fun extractShowTitle(html: String): String {
+        matchGroup(OG_NAME, html)?.let { name ->
+            val cleaned = cleanText(name)
+            if (cleaned.isNotBlank()) return cleaned
+        }
+        matchGroup(H1_TITLE, html)?.let { h1 ->
+            val cleaned = cleanText(h1)
+            if (cleaned.isNotBlank()) return cleaned
+        }
+        return extractTitle(html)
+    }
+
+    private fun buildEpisodeTitle(showTitle: String, episodeLabel: String): String {
+        val show = showTitle.trim().ifBlank { "视频" }
+        val ep = episodeLabel.trim()
+        if (ep.isBlank()) return show
+        return if (show.contains(ep)) show else "$show $ep"
+    }
+
+    private fun normalizeEpisodeLabel(raw: String): String {
+        val text = cleanText(raw)
+        if (text.isBlank()) return ""
+        val m = EPISODE_NUM.matcher(text)
+        if (m.find()) {
+            val num = m.group(1)?.toIntOrNull() ?: m.group(2)?.toIntOrNull()
+            if (num != null) return "第${num.toString().padStart(2, '0')}集"
+            return text.take(16)
+        }
+        if (text.contains("集") || text.contains("期") || text.contains("话")) {
+            return text.take(16)
+        }
+        return ""
+    }
+
+    private fun guessEpisodeFromUrl(url: String): String {
+        val m = EPISODE_NUM.matcher(url)
+        if (m.find()) {
+            val num = m.group(1)?.toIntOrNull() ?: m.group(2)?.toIntOrNull() ?: return ""
+            return "第${num.toString().padStart(2, '0')}集"
+        }
+        return ""
+    }
+
+    private fun episodeSortKey(label: String): Int {
+        val m = EPISODE_NUM.matcher(label)
+        if (!m.find()) return Int.MAX_VALUE
+        return m.group(1)?.toIntOrNull() ?: m.group(2)?.toIntOrNull() ?: Int.MAX_VALUE
+    }
+
+    private fun matchGroup(pattern: Pattern, text: String): String? {
+        val matcher = pattern.matcher(text)
+        return if (matcher.find()) matcher.group(1) else null
+    }
+
     private fun cleanText(text: String): String {
         return text.replace(Regex("<[^>]+>"), "")
             .replace(Regex("\\s+"), " ")
@@ -550,6 +899,7 @@ class VideoSniffer(
 
     companion object {
         private const val TAG = "VideoSniffer"
+        private const val SNIFF_PARALLEL = 6
         private val MEDIA_EXT = listOf(".m3u8", ".mp4", ".webm", ".mkv", ".flv", ".ts")
 
         private val LIST_TYPE_ID: Pattern = Pattern.compile(
@@ -570,6 +920,34 @@ class VideoSniffer(
         )
         private val SRC_ATTR: Pattern = Pattern.compile(
             """(?i)<(?:video|source)[^>]+src=["']([^"']+)["']"""
+        )
+
+        private val PLAY_UL: Pattern = Pattern.compile(
+            """(?is)<ul[^>]*\bid=["']play["'][^>]*>(.*?)</ul>"""
+        )
+        private val PLAY_LI: Pattern = Pattern.compile(
+            """(?is)<li([^>]*)>(.*?)</li>"""
+        )
+        private val VIDEO_LIST: Pattern = Pattern.compile(
+            """(?is)<div[^>]*class=["'][^"']*\bvideolist\b[^"']*["'][^>]*>(.*?)</div>"""
+        )
+        private val PLAY_EP_ANCHOR: Pattern = Pattern.compile(
+            """(?is)<a[^>]+href=["']([^"']*/p/id-(\d+)-(\d+)-(\d+)\.html)["'][^>]*(?:title=["']([^"']*)["'])?[^>]*>(.*?)</a>"""
+        )
+        private val DOWN_LIST: Pattern = Pattern.compile(
+            """(?is)<div[^>]*\bid=["']downlist["'][^>]*>(.*?)</div>\s*</div>"""
+        )
+        private val THUNDER_EP: Pattern = Pattern.compile(
+            """(?is)<p>\s*(第[^<]*?)\s*<a[^>]+href=["'](https?://[^"']+\.(?:mp4|mkv|flv)[^"']*)["']"""
+        )
+        private val OG_NAME: Pattern = Pattern.compile(
+            """(?is)itemprop=["']name["'][^>]*content=["']([^"']+)["']"""
+        )
+        private val H1_TITLE: Pattern = Pattern.compile(
+            """(?is)<h1[^>]*>(.*?)</h1>"""
+        )
+        private val EPISODE_NUM: Pattern = Pattern.compile(
+            """(?i)第\s*0*(\d+)\s*[集话期]|[_\-\s]0*(\d{1,3})(?=\.(?:mp4|m3u8|mkv|ts|html)|$)"""
         )
 
         // MacCMS + custom SEO detail pages (incl. huanyuxing /v/id- and cdpop-like routes)

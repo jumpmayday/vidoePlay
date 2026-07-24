@@ -175,6 +175,48 @@ class ChallengedHttpClient(
         }
     }
 
+    /**
+     * Fast reachability check for sniff filtering (short timeouts).
+     * Accepts HTTP 200/206; for HLS also peeks for #EXTM3U.
+     */
+    fun probeMediaOk(url: String, referer: String? = null): Boolean {
+        if (url.isBlank() || (!url.startsWith("http://") && !url.startsWith("https://"))) {
+            return false
+        }
+        val builder = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
+            .header("Range", "bytes=0-2047")
+        if (!referer.isNullOrBlank()) {
+            builder.header("Referer", referer)
+        }
+        return try {
+            probeClient.newCall(builder.get().build()).execute().use { response ->
+                val code = response.code
+                if (code != 200 && code != 206) return false
+                val body = response.body ?: return false
+                if (url.contains(".m3u8", ignoreCase = true)) {
+                    val peek = body.source().readUtf8(64)
+                    peek.contains("#EXT")
+                } else {
+                    true
+                }
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private val probeClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(12, TimeUnit.SECONDS)
+            .build()
+    }
+
     fun getText(url: String, referer: String? = null): String {
         val builder = Request.Builder()
             .url(url)
