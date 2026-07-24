@@ -52,7 +52,15 @@ class ChallengedHttpClient(
                 }
 
                 if (trySolveUaChallenge(url, body)) {
-                    Thread.sleep(700L)
+                    // Volcano UAM reloads after ~t seconds (often 5); probing too early re-triggers the shield.
+                    val waitMs = extractUaReloadDelayMs(body)
+                    Thread.sleep(waitMs)
+                    return@repeat
+                }
+
+                // Still on the challenge interstitial — keep waiting/retrying.
+                if (isUaChallengePage(body)) {
+                    Thread.sleep(1_000L)
                     return@repeat
                 }
 
@@ -231,6 +239,17 @@ class ChallengedHttpClient(
         return true
     }
 
+    /** Browser waits `t` seconds then reloads; default 5s for Volcano Engine UAM. */
+    private fun extractUaReloadDelayMs(html: String): Long {
+        val fromLoadFunc = matchGroup(UA_TIMER, html)?.toIntOrNull()
+        val seconds = (fromLoadFunc ?: DEFAULT_UA_WAIT_SEC).coerceIn(1, 15)
+        return seconds * 1_000L + UA_WAIT_EXTRA_MS
+    }
+
+    private fun isUaChallengePage(html: String): Boolean {
+        return CPK.matcher(html).find() && NONCE.matcher(html).find()
+    }
+
     private fun matchGroup(pattern: Pattern, text: String): String? {
         val matcher = pattern.matcher(text)
         return if (matcher.find()) matcher.group(1) else null
@@ -241,12 +260,19 @@ class ChallengedHttpClient(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
+        private const val DEFAULT_UA_WAIT_SEC = 5
+        private const val UA_WAIT_EXTRA_MS = 300L
+
         private val COOKIE_JS: Pattern =
             Pattern.compile("""document\.cookie\s*=\s*"([^"]+)"""")
         private val CPK: Pattern = Pattern.compile("""var\s+cpk\s*=\s*"([^"]+)"""")
         private val STEP: Pattern = Pattern.compile("""var\s+step\s*=\s*"([^"]+)"""")
         private val NONCE: Pattern = Pattern.compile("""var\s+nonce\s*=\s*(\d+)""")
-
+        /** Matches `function loadFunc(){var e=document.cookie,t=5;` */
+        private val UA_TIMER: Pattern = Pattern.compile(
+            """function\s+loadFunc\s*\(\)\s*\{[^}]{0,120}?\bt\s*=\s*(\d+)""",
+            Pattern.CASE_INSENSITIVE or Pattern.DOTALL
+        )
         fun defaultClient(): OkHttpClient {
             val dispatcher = okhttp3.Dispatcher().apply {
                 maxRequests = 64

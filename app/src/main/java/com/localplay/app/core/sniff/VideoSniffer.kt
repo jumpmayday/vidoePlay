@@ -32,17 +32,48 @@ class VideoSniffer(
             )
         }
 
-        // MacCMS JSON API first (works for listnew / list pages even when HTML structure differs).
-        val apiVideos = sniffViaMacCmsApi(normalized, onStatus)
-        if (apiVideos.isNotEmpty()) return apiVideos
+        // MacCMS JSON API first for list pages (works even when HTML structure differs).
+        // Single detail pages (/v/id-N.html) need the UA cookie gate first — skip cold API.
+        val detailVodId = extractDetailVodId(normalized)
+        if (detailVodId == null) {
+            val apiVideos = sniffViaMacCmsApi(normalized, onStatus)
+            if (apiVideos.isNotEmpty()) return apiVideos
+        }
 
         val html = http.getHtml(normalized)
         if (looksLikeBlocked(html)) {
             throw IllegalStateException("站点拒绝访问（可能限制 IP / 地区），请换网络后重试")
         }
 
+        // After challenge cookies exist, try MacCMS detail by vod id.
+        if (detailVodId != null) {
+            val origin = originOf(normalized)
+            if (origin != null) {
+                onStatus("拉取影片播放地址…")
+                val fromDetailApi = fetchMacCmsDetails(
+                    origin = origin,
+                    ids = listOf(detailVodId),
+                    pageUrl = normalized,
+                    onStatus = onStatus
+                )
+                if (fromDetailApi.isNotEmpty()) return fromDetailApi
+            }
+        }
+
         val fromPlayer = extractFromPlayerJson(html, normalized)
         if (fromPlayer.isNotEmpty()) return fromPlayer
+
+        // Detail pages: prefer play-page m3u8 over loose .mp4 strings in HTML.
+        val playLinks = extractPlayLinks(html, normalized)
+        if (playLinks.isNotEmpty()) {
+            onStatus("发现 ${playLinks.size} 个播放源…")
+            val fromPlay = resolvePlayPages(
+                playLinks = playLinks.distinct().take(8),
+                titleHint = extractTitle(html),
+                onStatus = onStatus
+            )
+            if (fromPlay.isNotEmpty()) return fromPlay
+        }
 
         val direct = extractDirectMediaUrls(html, normalized)
         if (direct.isNotEmpty()) return direct
@@ -51,12 +82,6 @@ class VideoSniffer(
         if (details.isNotEmpty()) {
             onStatus("发现 ${details.size} 个影片页，开始解析播放地址…")
             return resolveDetails(details.take(maxDetailPages), onStatus)
-        }
-
-        val playLinks = extractPlayLinks(html, normalized)
-        if (playLinks.isNotEmpty()) {
-            onStatus("发现 ${playLinks.size} 个播放页…")
-            return resolvePlayPages(playLinks, extractTitle(html), onStatus)
         }
 
         return emptyList()
@@ -142,7 +167,17 @@ class VideoSniffer(
         if (ids.isEmpty()) return emptyList()
 
         onStatus("拉取 ${ids.size.coerceAtMost(20)} 条播放地址…")
-        val detailIds = ids.take(20).joinToString(",")
+        return fetchMacCmsDetails(origin, ids.take(20), pageUrl, onStatus)
+    }
+
+    private fun fetchMacCmsDetails(
+        origin: String,
+        ids: List<String>,
+        pageUrl: String,
+        onStatus: (String) -> Unit
+    ): List<SniffedVideo> {
+        if (ids.isEmpty()) return emptyList()
+        val detailIds = ids.joinToString(",")
         val detailEndpoints = listOf(
             "$origin/api.php/provide/vod/?ac=detail&ids=$detailIds",
             "$origin/api.php/provide/vod/at/json/?ac=detail&ids=$detailIds"
@@ -150,6 +185,9 @@ class VideoSniffer(
         for (endpoint in detailEndpoints) {
             try {
                 val detailBody = http.getText(endpoint, referer = pageUrl)
+                if (detailBody.isBlank() || looksLikeBlocked(detailBody) || detailBody.trimStart().startsWith("<")) {
+                    continue
+                }
                 val detailRoot = JSONObject(detailBody)
                 val detailList = detailRoot.optJSONArray("list") ?: continue
                 val result = LinkedHashMap<String, SniffedVideo>()
@@ -161,7 +199,10 @@ class VideoSniffer(
                         result.putIfAbsent(it.mediaUrl, it)
                     }
                 }
-                if (result.isNotEmpty()) return result.values.toList()
+                if (result.isNotEmpty()) {
+                    onStatus("接口解析到 ${result.size} 个地址")
+                    return result.values.toList()
+                }
             } catch (e: Exception) {
                 Log.i(TAG, "detail api failed: $endpoint (${e.message})")
             }
@@ -406,6 +447,12 @@ class VideoSniffer(
         return if (m.find()) m.group(1) else null
     }
 
+    /** `/v/id-205300.html` / `/voddetail/205300.html` style single-vod pages. */
+    private fun extractDetailVodId(pageUrl: String): String? {
+        val m = DETAIL_VOD_ID.matcher(pageUrl)
+        return if (m.find()) m.group(1) else null
+    }
+
     private fun originOf(pageUrl: String): String? {
         return try {
             val uri = URI(pageUrl)
@@ -507,6 +554,10 @@ class VideoSniffer(
 
         private val LIST_TYPE_ID: Pattern = Pattern.compile(
             """(?i)/(?:listnew|list|type|show)/(?:id-)?(\d+)(?:\.html|/)?"""
+        )
+
+        private val DETAIL_VOD_ID: Pattern = Pattern.compile(
+            """(?i)/(?:v/id-|voddetail/|detail/|view/|movie/|video/|vod/|film/)(\d+)(?:\.html|/)?"""
         )
 
         private val PLAYER_JSON: Pattern = Pattern.compile(
