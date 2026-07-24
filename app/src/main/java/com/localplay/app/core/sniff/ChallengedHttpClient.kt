@@ -74,6 +74,7 @@ class ChallengedHttpClient(
         output: OutputStream,
         referer: String? = null,
         startByte: Long = 0L,
+        endByte: Long? = null,
         onBytes: ((Long, Long?) -> Unit)? = null
     ): CopyResult {
         val builder = Request.Builder()
@@ -83,13 +84,17 @@ class ChallengedHttpClient(
         if (!referer.isNullOrBlank()) {
             builder.header("Referer", referer)
         }
-        if (startByte > 0L) {
-            builder.header("Range", "bytes=$startByte-")
+        if (startByte > 0L || endByte != null) {
+            val range = if (endByte != null) {
+                "bytes=$startByte-$endByte"
+            } else {
+                "bytes=$startByte-"
+            }
+            builder.header("Range", range)
         }
         client.newCall(builder.get().build()).execute().use { response ->
             val code = response.code
-            if (startByte > 0L && code == 200) {
-                // Server ignored Range; discard body so caller can restart cleanly.
+            if ((startByte > 0L || endByte != null) && code == 200) {
                 response.body?.close()
                 return CopyResult(0L, null, code, resumed = false)
             }
@@ -101,31 +106,64 @@ class ChallengedHttpClient(
             val totalSize = when {
                 code == 206 -> {
                     val range = response.header("Content-Range")
-                    // bytes start-end/total
                     range?.substringAfter('/')?.toLongOrNull()?.takeIf { it > 0 }
                         ?: contentLen?.let { it + startByte }
                 }
                 else -> contentLen
             }
             var read = 0L
+            var lastEmit = 0L
             body.source().use { source ->
                 val sink = output.sink().buffer()
                 while (true) {
-                    val count = source.read(sink.buffer, 8_192L)
+                    val count = source.read(sink.buffer, READ_BUFFER_BYTES)
                     if (count < 0L) break
                     read += count
                     sink.emit()
                     val absolute = if (code == 206) startByte + read else read
-                    onBytes?.invoke(absolute, totalSize)
+                    if (onBytes != null && (absolute - lastEmit >= PROGRESS_EMIT_BYTES || count < READ_BUFFER_BYTES)) {
+                        lastEmit = absolute
+                        onBytes.invoke(absolute, totalSize)
+                    }
                 }
                 sink.flush()
             }
+            onBytes?.invoke(
+                if (code == 206) startByte + read else read,
+                totalSize
+            )
             return CopyResult(
                 bytesWritten = read,
                 totalSize = totalSize,
                 httpCode = code,
                 resumed = code == 206
             )
+        }
+    }
+
+    /** Probe total size via Range probe (works on most CDNs that ignore HEAD). */
+    fun probeContentLength(url: String, referer: String? = null): Long? {
+        val builder = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
+            .header("Range", "bytes=0-0")
+        if (!referer.isNullOrBlank()) {
+            builder.header("Referer", referer)
+        }
+        return try {
+            client.newCall(builder.get().build()).execute().use { response ->
+                if (response.code == 206) {
+                    response.header("Content-Range")
+                        ?.substringAfter('/')
+                        ?.toLongOrNull()
+                        ?.takeIf { it > 0 }
+                } else {
+                    response.header("Content-Length")?.toLongOrNull()?.takeIf { it > 0 }
+                }
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -210,15 +248,26 @@ class ChallengedHttpClient(
         private val NONCE: Pattern = Pattern.compile("""var\s+nonce\s*=\s*(\d+)""")
 
         fun defaultClient(): OkHttpClient {
+            val dispatcher = okhttp3.Dispatcher().apply {
+                maxRequests = 64
+                maxRequestsPerHost = 16
+            }
             return OkHttpClient.Builder()
                 .cookieJar(MemoryCookieJar)
-                .connectTimeout(20, TimeUnit.SECONDS)
+                .dispatcher(dispatcher)
+                .connectionPool(okhttp3.ConnectionPool(16, 5, TimeUnit.MINUTES))
+                .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(120, TimeUnit.SECONDS)
                 .writeTimeout(120, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
                 .followRedirects(true)
                 .followSslRedirects(true)
                 .build()
         }
+
+        /** Larger pipe + less UI churn for faster throughput. */
+        private const val READ_BUFFER_BYTES = 256L * 1024L
+        private const val PROGRESS_EMIT_BYTES = 256L * 1024L
     }
 }
 

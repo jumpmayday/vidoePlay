@@ -16,9 +16,15 @@ import com.localplay.app.core.sniff.ChallengedHttpClient
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.net.URI
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class DownloadAbortedException : Exception("download aborted")
 
@@ -73,6 +79,31 @@ class ResumableDownloadEngine(
         if (offset > 0L) {
             current = current.copy(downloadedBytes = offset)
             onProgress(current)
+        }
+
+        // Fresh large files: multi-Range parallel (sequential resume stays single-stream).
+        if (offset == 0L) {
+            try {
+                val multi = tryMultiRangeProgressive(current, partial, shouldAbort, onProgress)
+                if (multi != null) {
+                    current = multi
+                    val outputUri = publishFinal(partial, current.fileName, current.treeUri, mimeFor(current))
+                    return current.copy(
+                        status = DownloadStatus.COMPLETED,
+                        outputUri = outputUri.toString(),
+                        partialPath = partial.absolutePath,
+                        updatedAt = System.currentTimeMillis(),
+                        errorMessage = ""
+                    )
+                }
+            } catch (e: DownloadAbortedException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "multi-range fallback to single stream", e)
+                if (partial.exists()) partial.delete()
+                current = current.copy(downloadedBytes = 0L, totalBytes = -1L)
+                onProgress(current)
+            }
         }
 
         var restarted = false
@@ -130,6 +161,130 @@ class ResumableDownloadEngine(
         )
     }
 
+    /**
+     * Parallel Range download into a pre-sized file. Returns null if server/size unsuitable.
+     * Note: mid-file holes may appear until all ranges finish — fine for speed; resume falls back.
+     */
+    private fun tryMultiRangeProgressive(
+        task: DownloadTaskEntity,
+        partial: File,
+        shouldAbort: () -> Boolean,
+        onProgress: (DownloadTaskEntity) -> Unit
+    ): DownloadTaskEntity? {
+        val total = http.probeContentLength(task.mediaUrl, task.pageUrl.ifBlank { null })
+            ?: return null
+        if (total < MIN_MULTI_RANGE_BYTES) return null
+
+        val connections = PROGRESSIVE_CONNECTIONS
+        val chunk = (total + connections - 1) / connections
+        val referer = task.pageUrl.ifBlank { null }
+        val downloaded = AtomicLong(0L)
+        val failed = AtomicBoolean(false)
+        var error: Exception? = null
+        var current = task.copy(totalBytes = total, downloadedBytes = 0L)
+        val progressLock = Any()
+
+        RandomAccessFile(partial, "rw").use { raf ->
+            raf.setLength(total)
+            val pool = Executors.newFixedThreadPool(connections)
+            try {
+                val futures = ArrayList<Future<*>>(connections)
+                for (i in 0 until connections) {
+                    val start = i * chunk
+                    if (start >= total) break
+                    val end = minOf(total - 1, start + chunk - 1)
+                    futures += pool.submit {
+                        try {
+                            checkAbort(shouldAbort)
+                            val out = RangeOutputStream(raf, start)
+                            val result = http.copyTo(
+                                url = task.mediaUrl,
+                                output = out,
+                                referer = referer,
+                                startByte = start,
+                                endByte = end
+                            ) { _, _ ->
+                                checkAbort(shouldAbort)
+                            }
+                            if (result.httpCode == 200 && start > 0L) {
+                                throw IllegalStateException("server ignored Range")
+                            }
+                            val soFar = downloaded.addAndGet(result.bytesWritten)
+                            val snap = synchronized(progressLock) {
+                                current = current.copy(
+                                    downloadedBytes = soFar.coerceAtMost(total),
+                                    totalBytes = total,
+                                    updatedAt = System.currentTimeMillis()
+                                )
+                                current
+                            }
+                            onProgress(snap)
+                        } catch (e: DownloadAbortedException) {
+                            failed.set(true)
+                            throw e
+                        } catch (e: Exception) {
+                            failed.set(true)
+                            synchronized(progressLock) {
+                                if (error == null) error = e
+                            }
+                            throw e
+                        }
+                    }
+                }
+                futures.forEach { future ->
+                    try {
+                        future.get()
+                    } catch (e: Exception) {
+                        failed.set(true)
+                        val cause = (e.cause as? Exception) ?: e
+                        if (cause is DownloadAbortedException) throw cause
+                        synchronized(progressLock) {
+                            if (error == null) error = cause
+                        }
+                    }
+                }
+            } finally {
+                pool.shutdownNow()
+            }
+        }
+
+        if (failed.get()) {
+            partial.delete()
+            error?.let { throw it }
+            return null
+        }
+        if (partial.length() != total) {
+            partial.delete()
+            return null
+        }
+        return current.copy(downloadedBytes = total, totalBytes = total)
+    }
+
+    /** Thread-safe OutputStream that writes into a shared RandomAccessFile at a base offset. */
+    private class RangeOutputStream(
+        private val raf: RandomAccessFile,
+        baseOffset: Long
+    ) : java.io.OutputStream() {
+        private var position = baseOffset
+
+        override fun write(b: Int) {
+            synchronized(raf) {
+                raf.seek(position)
+                raf.write(b)
+                position++
+            }
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            if (len <= 0) return
+            synchronized(raf) {
+                raf.seek(position)
+                raf.write(b, off, len)
+                position += len.toLong()
+            }
+        }
+    }
+
     private fun downloadHls(
         task: DownloadTaskEntity,
         shouldAbort: () -> Boolean,
@@ -161,23 +316,9 @@ class ResumableDownloadEngine(
             partial.delete()
         }
 
-        FileOutputStream(partial, current.hlsSegmentIndex > 0).use { output ->
-            for (index in current.hlsSegmentIndex until segments.size) {
-                checkAbort(shouldAbort)
-                http.copyTo(
-                    url = segments[index],
-                    output = output,
-                    referer = current.pageUrl.ifBlank { null },
-                    startByte = 0L
-                )
-                output.flush()
-                current = current.copy(
-                    hlsSegmentIndex = index + 1,
-                    downloadedBytes = partial.length(),
-                    updatedAt = System.currentTimeMillis()
-                )
-                onProgress(current)
-            }
+        downloadHlsParallel(current, partial, segments, shouldAbort) { updated ->
+            current = updated
+            onProgress(current)
         }
 
         val outputUri = publishFinal(partial, current.fileName, current.treeUri, "video/mp2t")
@@ -188,9 +329,105 @@ class ResumableDownloadEngine(
             partialPath = partial.absolutePath,
             hlsSegmentIndex = segments.size,
             hlsSegmentTotal = segments.size,
+            downloadedBytes = partial.length(),
             updatedAt = System.currentTimeMillis(),
             errorMessage = ""
         )
+    }
+
+    /**
+     * Fetch several HLS segments concurrently into temp files, then append in order
+     * so the growing partial stays sequentially readable for 边下边播.
+     */
+    private fun downloadHlsParallel(
+        task: DownloadTaskEntity,
+        partial: File,
+        segments: List<String>,
+        shouldAbort: () -> Boolean,
+        onProgress: (DownloadTaskEntity) -> Unit
+    ) {
+        val referer = task.pageUrl.ifBlank { null }
+        val startIndex = task.hlsSegmentIndex
+        val parallelism = HLS_SEGMENT_PARALLEL
+        val segDir = File(partial.parentFile, "${partial.name}.segs").apply {
+            if (exists()) deleteRecursively()
+            mkdirs()
+        }
+        val pool = Executors.newFixedThreadPool(parallelism)
+        val ready = ConcurrentHashMap<Int, File>()
+        val latchByIndex = ConcurrentHashMap<Int, CountDownLatch>()
+        var current = task
+        try {
+            FileOutputStream(partial, startIndex > 0).use { output ->
+                var nextToWrite = startIndex
+                var fetchCursor = startIndex
+                val inflight = ArrayList<Future<*>>()
+
+                fun ensureLatch(index: Int): CountDownLatch {
+                    return latchByIndex.getOrPut(index) { CountDownLatch(1) }
+                }
+
+                fun submitFetch(index: Int): Future<*> {
+                    ensureLatch(index)
+                    return pool.submit {
+                        checkAbort(shouldAbort)
+                        val tmp = File(segDir, "$index.ts")
+                        FileOutputStream(tmp).use { out ->
+                            http.copyTo(
+                                url = segments[index],
+                                output = out,
+                                referer = referer,
+                                startByte = 0L
+                            )
+                        }
+                        ready[index] = tmp
+                        ensureLatch(index).countDown()
+                    }
+                }
+
+                while (nextToWrite < segments.size) {
+                    checkAbort(shouldAbort)
+                    while (fetchCursor < segments.size &&
+                        fetchCursor - nextToWrite < parallelism
+                    ) {
+                        inflight += submitFetch(fetchCursor)
+                        fetchCursor++
+                    }
+
+                    val latch = ensureLatch(nextToWrite)
+                    while (!latch.await(200L, TimeUnit.MILLISECONDS)) {
+                        checkAbort(shouldAbort)
+                        // Surface worker exceptions early.
+                        inflight.filter { it.isDone }.forEach { done ->
+                            done.get()
+                            inflight.remove(done)
+                        }
+                    }
+                    inflight.filter { it.isDone }.forEach { done ->
+                        done.get()
+                        inflight.remove(done)
+                    }
+
+                    val segFile = ready.remove(nextToWrite)
+                        ?: throw IllegalStateException("分片缺失 index=$nextToWrite")
+                    FileInputStream(segFile).use { input -> input.copyTo(output) }
+                    output.flush()
+                    segFile.delete()
+                    latchByIndex.remove(nextToWrite)
+                    nextToWrite++
+                    current = current.copy(
+                        hlsSegmentIndex = nextToWrite,
+                        downloadedBytes = partial.length(),
+                        updatedAt = System.currentTimeMillis()
+                    )
+                    onProgress(current)
+                }
+                inflight.forEach { it.get() }
+            }
+        } finally {
+            pool.shutdownNow()
+            segDir.deleteRecursively()
+        }
     }
 
     private fun publishFinal(
@@ -363,5 +600,11 @@ class ResumableDownloadEngine(
 
     companion object {
         private const val TAG = "ResumableDownload"
+        /** Concurrent m3u8 segment fetches per task (ordered append). */
+        private const val HLS_SEGMENT_PARALLEL = 6
+        /** Parallel HTTP Range connections for large progressive files. */
+        private const val PROGRESSIVE_CONNECTIONS = 4
+        /** Skip multi-range for small files (overhead not worth it). */
+        private const val MIN_MULTI_RANGE_BYTES = 8L * 1024L * 1024L
     }
 }

@@ -107,7 +107,13 @@ fun LocalPlayNavHost() {
                 PlayerScreen(
                     path = path,
                     fromStart = fromStart,
-                    onBack = { navController.popBackStack() }
+                    onBack = { navController.popBackStack() },
+                    onOpenSniff = { navController.navigate(Routes.SNIFF) },
+                    onOpenPlayer = { playPath ->
+                        navController.navigate(Routes.player(playPath, fromStart = true)) {
+                            launchSingleTop = true
+                        }
+                    }
                 )
             }
         }

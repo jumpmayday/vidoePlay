@@ -61,51 +61,47 @@ class DownloadRepository(context: Context) {
 
     suspend fun pause(id: Long) {
         val task = dao.getById(id) ?: return
-        if (task.status == DownloadStatus.RUNNING || task.status == DownloadStatus.QUEUED) {
-            dao.update(
-                task.copy(
-                    status = DownloadStatus.PAUSED,
-                    updatedAt = System.currentTimeMillis()
-                )
+        if (task.status != DownloadStatus.RUNNING && task.status != DownloadStatus.QUEUED) return
+        val at = System.currentTimeMillis()
+        dao.update(
+            task.copy(
+                status = DownloadStatus.PAUSED,
+                updatedAt = at
             )
-            val intent = Intent(appContext, DownloadService::class.java).apply {
-                action = DownloadService.ACTION_PAUSE
-                putExtra(DownloadService.EXTRA_TASK_ID, id)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                appContext.startForegroundService(intent)
-            } else {
-                appContext.startService(intent)
-            }
+        )
+        val intent = Intent(appContext, DownloadService::class.java).apply {
+            action = DownloadService.ACTION_PAUSE
+            putExtra(DownloadService.EXTRA_TASK_ID, id)
+            putExtra(DownloadService.EXTRA_ACTION_AT, at)
         }
+        startServiceIntent(intent)
     }
 
     suspend fun resume(id: Long) {
         val task = dao.getById(id) ?: return
-        if (task.status == DownloadStatus.PAUSED || task.status == DownloadStatus.FAILED) {
-            dao.update(
-                task.copy(
-                    status = DownloadStatus.QUEUED,
-                    errorMessage = "",
-                    updatedAt = System.currentTimeMillis()
-                )
+        if (task.status != DownloadStatus.PAUSED && task.status != DownloadStatus.FAILED) return
+        val at = System.currentTimeMillis()
+        dao.update(
+            task.copy(
+                status = DownloadStatus.QUEUED,
+                errorMessage = "",
+                updatedAt = at
             )
-            startService()
+        )
+        val intent = Intent(appContext, DownloadService::class.java).apply {
+            action = DownloadService.ACTION_RESUME
+            putExtra(DownloadService.EXTRA_TASK_ID, id)
+            putExtra(DownloadService.EXTRA_ACTION_AT, at)
         }
+        startServiceIntent(intent)
     }
 
-    /**
-     * Discard partial progress and enqueue from the beginning.
-     */
     suspend fun restart(id: Long) {
         val task = dao.getById(id) ?: return
-        if (task.status == DownloadStatus.RUNNING || task.status == DownloadStatus.QUEUED) {
-            pause(id)
-        }
+        val at = System.currentTimeMillis()
         if (task.partialPath.isNotBlank()) {
             runCatching { java.io.File(task.partialPath).delete() }
         }
-        // Also clear any leftover part file by id pattern.
         runCatching {
             val dir = java.io.File(appContext.filesDir, "download_partials")
             dir.listFiles()?.filter { it.name.startsWith("${id}_") }?.forEach { it.delete() }
@@ -120,18 +116,30 @@ class DownloadRepository(context: Context) {
                 partialPath = "",
                 outputUri = "",
                 errorMessage = "",
-                updatedAt = System.currentTimeMillis()
+                updatedAt = at
             )
         )
-        startService()
+        val intent = Intent(appContext, DownloadService::class.java).apply {
+            action = DownloadService.ACTION_RESUME
+            putExtra(DownloadService.EXTRA_TASK_ID, id)
+            putExtra(DownloadService.EXTRA_ACTION_AT, at)
+        }
+        startServiceIntent(intent)
     }
 
     suspend fun cancel(id: Long) {
         val task = dao.getById(id) ?: return
+        val at = System.currentTimeMillis()
         if (task.partialPath.isNotBlank()) {
             runCatching { java.io.File(task.partialPath).delete() }
         }
         dao.deleteById(id)
+        val intent = Intent(appContext, DownloadService::class.java).apply {
+            action = DownloadService.ACTION_RESUME
+            putExtra(DownloadService.EXTRA_TASK_ID, id)
+            putExtra(DownloadService.EXTRA_ACTION_AT, at)
+        }
+        startServiceIntent(intent)
     }
 
     suspend fun clearCompleted() {
@@ -150,6 +158,10 @@ class DownloadRepository(context: Context) {
         val intent = Intent(appContext, DownloadService::class.java).apply {
             action = DownloadService.ACTION_PROCESS_QUEUE
         }
+        startServiceIntent(intent)
+    }
+
+    private fun startServiceIntent(intent: Intent) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             appContext.startForegroundService(intent)
         } else {

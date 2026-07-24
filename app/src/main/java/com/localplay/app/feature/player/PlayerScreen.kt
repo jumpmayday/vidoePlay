@@ -39,30 +39,47 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCut
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.DragHandle
+import androidx.compose.material.icons.filled.Equalizer
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.ScreenRotation
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -72,18 +89,22 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import java.util.concurrent.atomic.AtomicInteger
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -96,11 +117,16 @@ import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.localplay.app.LocalPlayApp
+import com.localplay.app.core.database.DownloadStatus
+import com.localplay.app.core.database.DownloadTaskEntity
+import com.localplay.app.core.download.DownloadPlayback
 import com.localplay.app.core.common.Formatters
 import com.localplay.app.data.model.VideoItem
+import com.localplay.app.ui.theme.LpDanger
 import com.localplay.app.ui.theme.LpOnPrimary
 import com.localplay.app.ui.theme.LpOverlay
 import com.localplay.app.ui.theme.LpPrimary
+import com.localplay.app.ui.theme.LpSuccess
 import com.localplay.app.ui.theme.LpSurface
 import com.localplay.app.ui.theme.LpSurface2
 import com.localplay.app.ui.theme.LpSurface3
@@ -121,7 +147,13 @@ private enum class GestureZone {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PlayerScreen(path: String, fromStart: Boolean, onBack: () -> Unit) {
+fun PlayerScreen(
+    path: String,
+    fromStart: Boolean,
+    onBack: () -> Unit,
+    onOpenSniff: () -> Unit = {},
+    onOpenPlayer: (String) -> Unit = {}
+) {
     val context = LocalContext.current
     val activity = context as? Activity
     val repository = LocalPlayApp.instance.videoRepository
@@ -159,6 +191,8 @@ fun PlayerScreen(path: String, fromStart: Boolean, onBack: () -> Unit) {
         path = path,
         fromStart = fromStart,
         onBack = onBack,
+        onOpenSniff = onOpenSniff,
+        onOpenPlayer = onOpenPlayer,
         context = context,
         activity = activity,
         repository = repository,
@@ -175,6 +209,8 @@ private fun PlayerScreenContent(
     path: String,
     fromStart: Boolean,
     onBack: () -> Unit,
+    onOpenSniff: () -> Unit,
+    onOpenPlayer: (String) -> Unit,
     context: Context,
     activity: Activity?,
     repository: com.localplay.app.data.repository.VideoRepository,
@@ -205,6 +241,18 @@ private fun PlayerScreenContent(
     var clipProgress by remember { mutableFloatStateOf(0f) }
     var screenshotPreview by remember { mutableStateOf<Bitmap?>(null) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
+    var showPlaylist by remember { mutableStateOf(false) }
+    var playlistQuery by remember { mutableStateOf("") }
+    var showDownloads by remember { mutableStateOf(false) }
+    val downloadRepo = LocalPlayApp.instance.downloadRepository
+    val downloadTasks by downloadRepo.tasks.collectAsState(initial = emptyList())
+    val activeDownloadCount = remember(downloadTasks) {
+        downloadTasks.count {
+            it.status == DownloadStatus.RUNNING ||
+                it.status == DownloadStatus.QUEUED ||
+                it.status == DownloadStatus.PAUSED
+        }
+    }
 
     val audioManager = remember {
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -217,6 +265,8 @@ private fun PlayerScreenContent(
     var currentIndex by remember {
         mutableStateOf(siblings.indexOfFirst { it.path == path }.coerceAtLeast(0))
     }
+    val currentIndexRef = remember { AtomicInteger(currentIndex) }
+    SideEffect { currentIndexRef.set(currentIndex) }
 
     val downloadFinished = remember(path) { java.util.concurrent.atomic.AtomicBoolean(false) }
     val growingFile = remember(path, initialVideo.uri) {
@@ -358,6 +408,22 @@ private fun PlayerScreenContent(
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
     }
 
+    fun switchTo(index: Int) {
+        if (index !in siblings.indices) return
+        persistProgress()
+        val next = siblings[index]
+        currentIndex = index
+        currentIndexRef.set(index)
+        currentVideo = next
+        exoPlayer.setMediaItem(MediaItem.fromUri(next.uri))
+        exoPlayer.prepare()
+        exoPlayer.play()
+        durationMs = next.durationMs
+        controlsVisible = true
+    }
+
+    val switchToLatest by rememberUpdatedState<(Int) -> Unit> { index -> switchTo(index) }
+
     DisposableEffect(Unit) {
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         val window = activity?.window
@@ -376,6 +442,12 @@ private fun PlayerScreenContent(
                 if (playbackState == Player.STATE_READY) {
                     val d = exoPlayer.duration
                     if (d != C.TIME_UNSET) durationMs = d
+                }
+                if (playbackState == Player.STATE_ENDED) {
+                    val next = currentIndexRef.get() + 1
+                    if (next in siblings.indices) {
+                        switchToLatest(next)
+                    }
                 }
             }
         }
@@ -401,8 +473,8 @@ private fun PlayerScreenContent(
         }
     }
 
-    LaunchedEffect(controlsVisible, locked, clipMode) {
-        if (controlsVisible && !locked && !clipMode) {
+    LaunchedEffect(controlsVisible, locked, clipMode, showPlaylist, showDownloads) {
+        if (controlsVisible && !locked && !clipMode && !showPlaylist && !showDownloads) {
             delay(4_000L)
             controlsVisible = false
         }
@@ -510,19 +582,6 @@ private fun PlayerScreenContent(
                 clipExporting = false
             }
         }
-    }
-
-    fun switchTo(index: Int) {
-        if (index !in siblings.indices) return
-        persistProgress()
-        val next = siblings[index]
-        currentIndex = index
-        currentVideo = next
-        exoPlayer.setMediaItem(MediaItem.fromUri(next.uri))
-        exoPlayer.prepare()
-        exoPlayer.play()
-        durationMs = next.durationMs
-        controlsVisible = true
     }
 
     Box(
@@ -671,10 +730,23 @@ private fun PlayerScreenContent(
         }
 
         if (controlsVisible && !locked && !clipMode) {
-            TopBar(video = currentVideo, onBack = {
-                persistProgress()
-                onBack()
-            })
+            TopBar(
+                video = currentVideo,
+                playlistCount = siblings.size,
+                activeDownloadCount = activeDownloadCount,
+                onBack = {
+                    persistProgress()
+                    onBack()
+                },
+                onPlaylist = {
+                    showPlaylist = true
+                    controlsVisible = true
+                },
+                onDownloads = {
+                    showDownloads = true
+                    controlsVisible = true
+                }
+            )
             BottomControls(
                 modifier = Modifier.align(Alignment.BottomCenter),
                 positionMs = positionMs,
@@ -831,6 +903,62 @@ private fun PlayerScreenContent(
                 })
             }
         }
+
+        if (showPlaylist) {
+            PlaylistOverlay(
+                videos = siblings,
+                currentIndex = currentIndex,
+                query = playlistQuery,
+                onQueryChange = { playlistQuery = it },
+                onSelect = { index ->
+                    switchTo(index)
+                    showPlaylist = false
+                    playlistQuery = ""
+                },
+                onDismiss = {
+                    showPlaylist = false
+                    playlistQuery = ""
+                }
+            )
+        }
+
+        if (showDownloads) {
+            DownloadStatusOverlay(
+                tasks = downloadTasks,
+                onPause = { id -> scope.launch { downloadRepo.pause(id) } },
+                onResume = { id -> scope.launch { downloadRepo.resume(id) } },
+                onRestart = { id -> scope.launch { downloadRepo.restart(id) } },
+                onCancel = { id -> scope.launch { downloadRepo.cancel(id) } },
+                onClearCompleted = { scope.launch { downloadRepo.clearCompleted() } },
+                onPlay = { task ->
+                    scope.launch {
+                        var latest = downloadRepo.getTask(task.id) ?: task
+                        when (latest.status) {
+                            DownloadStatus.PAUSED, DownloadStatus.FAILED ->
+                                downloadRepo.resume(latest.id)
+                            DownloadStatus.QUEUED -> downloadRepo.startService()
+                            else -> Unit
+                        }
+                        latest = downloadRepo.getTask(task.id) ?: latest
+                        val item = DownloadPlayback.toVideoItem(context, latest)
+                        repository.registerPlayable(item)
+                        showDownloads = false
+                        if (item.path != path && item.path != currentVideo.path) {
+                            persistProgress()
+                            onOpenPlayer(item.path)
+                        } else {
+                            statusMessage = "当前已在播放该下载"
+                        }
+                    }
+                },
+                onOpenSniff = {
+                    showDownloads = false
+                    persistProgress()
+                    onOpenSniff()
+                },
+                onDismiss = { showDownloads = false }
+            )
+        }
     }
 }
 
@@ -845,18 +973,448 @@ private fun MissingVideoScreen() {
 }
 
 @Composable
-private fun TopBar(video: VideoItem, onBack: () -> Unit) {
+private fun TopBar(
+    video: VideoItem,
+    playlistCount: Int,
+    activeDownloadCount: Int,
+    onBack: () -> Unit,
+    onPlaylist: () -> Unit,
+    onDownloads: () -> Unit
+) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(top = 36.dp, start = 8.dp, end = 12.dp),
+        modifier = Modifier.fillMaxWidth().padding(top = 36.dp, start = 8.dp, end = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         IconButton(onClick = onBack) {
             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null, tint = LpText)
         }
         Column(modifier = Modifier.weight(1f)) {
-            Text(video.displayName, style = LocalPlayTypography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                video.displayName,
+                style = LocalPlayTypography.bodyLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = LpText
+            )
             Text(video.folderName, style = LocalPlayTypography.labelSmall, color = LpText2)
         }
+        IconButton(onClick = onDownloads) {
+            Box {
+                Icon(
+                    Icons.Default.Download,
+                    contentDescription = "嗅探下载",
+                    tint = if (activeDownloadCount > 0) LpPrimary else LpText
+                )
+                if (activeDownloadCount > 0) {
+                    Text(
+                        text = if (activeDownloadCount > 9) "9+" else activeDownloadCount.toString(),
+                        color = LpOnPrimary,
+                        style = LocalPlayTypography.labelSmall,
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .background(LpPrimary, CircleShape)
+                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                    )
+                }
+            }
+        }
+        IconButton(onClick = onPlaylist) {
+            Icon(
+                Icons.AutoMirrored.Filled.PlaylistPlay,
+                contentDescription = "播放列表",
+                tint = LpText
+            )
+        }
+        if (playlistCount > 1) {
+            Text(
+                text = "${playlistCount}集",
+                color = LpText2,
+                style = LocalPlayTypography.labelSmall,
+                modifier = Modifier.padding(end = 4.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun DownloadStatusOverlay(
+    tasks: List<DownloadTaskEntity>,
+    onPause: (Long) -> Unit,
+    onResume: (Long) -> Unit,
+    onRestart: (Long) -> Unit,
+    onCancel: (Long) -> Unit,
+    onClearCompleted: () -> Unit,
+    onPlay: (DownloadTaskEntity) -> Unit,
+    onOpenSniff: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val active = remember(tasks) {
+        tasks.filter {
+            it.status != DownloadStatus.COMPLETED
+        }
+    }
+    val completed = remember(tasks) {
+        tasks.filter { it.status == DownloadStatus.COMPLETED }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.45f))
+            .clickable(onClick = onDismiss),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.78f)
+                .widthIn(max = 560.dp)
+                .fillMaxSize(0.82f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(LpSurface.copy(alpha = 0.96f))
+                .clickable(enabled = false) {}
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Download, contentDescription = null, tint = LpPrimary)
+                Text(
+                    "嗅探下载",
+                    style = LocalPlayTypography.titleMedium,
+                    color = LpText,
+                    modifier = Modifier.padding(start = 8.dp).weight(1f)
+                )
+                TextButton(onClick = onOpenSniff) {
+                    Text("去嗅探页", color = LpPrimary)
+                }
+                IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Default.Close, contentDescription = "关闭", tint = LpText2)
+                }
+            }
+            HorizontalDivider(color = LpSurface3)
+            if (tasks.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("暂无下载任务", color = LpText2)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        TextButton(onClick = onOpenSniff) {
+                            Text("去添加嗅探下载", color = LpPrimary)
+                        }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (active.isNotEmpty()) {
+                        item {
+                            Text(
+                                "进行中 · ${active.size}",
+                                color = LpText2,
+                                style = LocalPlayTypography.labelMedium,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
+                            )
+                        }
+                        items(active, key = { it.id }) { task ->
+                            PlayerDownloadRow(
+                                task = task,
+                                onPause = { onPause(task.id) },
+                                onResume = { onResume(task.id) },
+                                onRestart = { onRestart(task.id) },
+                                onCancel = { onCancel(task.id) },
+                                onPlay = { onPlay(task) }
+                            )
+                        }
+                    }
+                    if (completed.isNotEmpty()) {
+                        item {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 4.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "已完成 · ${completed.size}",
+                                    color = LpText2,
+                                    style = LocalPlayTypography.labelMedium,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(onClick = onClearCompleted) {
+                                    Text("清空已完成", color = LpText2)
+                                }
+                            }
+                        }
+                        items(completed, key = { "done-${it.id}" }) { task ->
+                            PlayerDownloadRow(
+                                task = task,
+                                onPause = { onPause(task.id) },
+                                onResume = { onResume(task.id) },
+                                onRestart = { onRestart(task.id) },
+                                onCancel = { onCancel(task.id) },
+                                onPlay = { onPlay(task) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlayerDownloadRow(
+    task: DownloadTaskEntity,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onRestart: () -> Unit,
+    onCancel: () -> Unit,
+    onPlay: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(LpSurface2)
+            .padding(10.dp)
+    ) {
+        Text(
+            task.title.ifBlank { task.fileName },
+            style = LocalPlayTypography.bodyMedium,
+            color = LpText,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            playerDownloadStatusLabel(task),
+            color = playerDownloadStatusColor(task.status),
+            style = LocalPlayTypography.labelSmall,
+            modifier = Modifier.padding(top = 2.dp)
+        )
+        if (task.status == DownloadStatus.RUNNING ||
+            task.status == DownloadStatus.QUEUED ||
+            task.status == DownloadStatus.PAUSED
+        ) {
+            LinearProgressIndicator(
+                progress = { task.progressFraction },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 6.dp)
+                    .height(5.dp)
+                    .clip(RoundedCornerShape(3.dp)),
+                color = LpPrimary,
+                trackColor = LpSurface3
+            )
+        }
+        if (task.errorMessage.isNotBlank()) {
+            Text(
+                task.errorMessage,
+                color = LpDanger,
+                style = LocalPlayTypography.labelSmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+            when (task.status) {
+                DownloadStatus.RUNNING, DownloadStatus.QUEUED -> {
+                    TextButton(onClick = onPause) { Text("暂停") }
+                    TextButton(onClick = onPlay) { Text("边下边播", color = LpPrimary) }
+                    TextButton(onClick = onRestart) { Text("重下") }
+                }
+                DownloadStatus.PAUSED, DownloadStatus.FAILED -> {
+                    TextButton(onClick = onResume) { Text("继续") }
+                    TextButton(onClick = onPlay) { Text("边下边播", color = LpPrimary) }
+                    TextButton(onClick = onRestart) { Text("重下") }
+                }
+                DownloadStatus.COMPLETED -> {
+                    TextButton(onClick = onPlay) { Text("播放", color = LpPrimary) }
+                    TextButton(onClick = onRestart) { Text("重下") }
+                }
+            }
+            if (task.status != DownloadStatus.COMPLETED) {
+                TextButton(onClick = onCancel) { Text("取消", color = LpDanger) }
+            }
+        }
+    }
+}
+
+private fun playerDownloadStatusLabel(task: DownloadTaskEntity): String {
+    val pct = (task.progressFraction * 100).toInt()
+    return when (task.status) {
+        DownloadStatus.QUEUED -> "排队中"
+        DownloadStatus.RUNNING -> if (task.isHls) {
+            "下载中 $pct%（分片 ${task.hlsSegmentIndex}/${task.hlsSegmentTotal}）"
+        } else {
+            "下载中 $pct%"
+        }
+        DownloadStatus.PAUSED -> "已暂停 $pct%"
+        DownloadStatus.FAILED -> "失败"
+        DownloadStatus.COMPLETED -> "已完成"
+    }
+}
+
+@Composable
+private fun playerDownloadStatusColor(status: DownloadStatus) = when (status) {
+    DownloadStatus.COMPLETED -> LpSuccess
+    DownloadStatus.FAILED -> LpDanger
+    DownloadStatus.PAUSED -> LpText2
+    else -> LpPrimary
+}
+
+
+
+@Composable
+private fun PlaylistOverlay(
+    videos: List<VideoItem>,
+    currentIndex: Int,
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onSelect: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val filtered = remember(videos, query) {
+        if (query.isBlank()) {
+            videos.mapIndexed { index, item -> index to item }
+        } else {
+            videos.mapIndexedNotNull { index, item ->
+                if (item.displayName.contains(query, ignoreCase = true)) index to item else null
+            }
+        }
+    }
+    val listState = rememberLazyListState()
+    LaunchedEffect(currentIndex, query) {
+        if (query.isBlank() && currentIndex in videos.indices) {
+            listState.animateScrollToItem(currentIndex.coerceAtMost((filtered.size - 1).coerceAtLeast(0)))
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.45f))
+            .clickable(onClick = onDismiss),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.72f)
+                .widthIn(max = 520.dp)
+                .fillMaxSize(0.78f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(LpSurface.copy(alpha = 0.94f))
+                .clickable(enabled = false) {}
+                .padding(bottom = 8.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Icon(Icons.Default.Search, contentDescription = null, tint = LpText2, modifier = Modifier.size(20.dp))
+                BasicTextField(
+                    value = query,
+                    onValueChange = onQueryChange,
+                    singleLine = true,
+                    textStyle = TextStyle(color = LpText, fontSize = 15.sp),
+                    cursorBrush = SolidColor(LpPrimary),
+                    modifier = Modifier.weight(1f),
+                    decorationBox = { inner ->
+                        if (query.isEmpty()) {
+                            Text("搜索媒体", color = LpText2, style = LocalPlayTypography.bodyMedium)
+                        }
+                        inner()
+                    }
+                )
+                IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Default.Close, contentDescription = "关闭", tint = LpText2)
+                }
+            }
+            HorizontalDivider(color = LpSurface3)
+            if (filtered.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("没有匹配的视频", color = LpText2)
+                }
+            } else {
+                LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                    itemsIndexed(filtered, key = { _, pair -> pair.second.path }) { _, pair ->
+                        val (index, item) = pair
+                        val playing = index == currentIndex
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelect(index) }
+                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.DragHandle,
+                                contentDescription = null,
+                                tint = LpText2,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = item.displayName,
+                                    color = if (playing) LpPrimary else LpText,
+                                    style = LocalPlayTypography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = playlistMeta(item),
+                                    color = LpText2,
+                                    style = LocalPlayTypography.labelSmall,
+                                    maxLines = 1
+                                )
+                            }
+                            if (playing) {
+                                Icon(
+                                    Icons.Default.Equalizer,
+                                    contentDescription = "正在播放",
+                                    tint = LpPrimary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun playlistMeta(video: VideoItem): String {
+    val duration = compactDuration(video.durationMs)
+    val res = when {
+        video.height >= 2160 -> "4K"
+        video.height >= 1080 -> "1080P"
+        video.height >= 720 -> "720P"
+        video.height > 0 -> "${video.height}P"
+        else -> null
+    }
+    return listOfNotNull(duration, res).joinToString(" · ")
+}
+
+private fun compactDuration(ms: Long): String {
+    if (ms <= 0L) return "--"
+    val totalMin = (ms / 60_000L).toInt()
+    val hours = totalMin / 60
+    val minutes = totalMin % 60
+    return when {
+        hours > 0 && minutes > 0 -> "${hours}h${minutes}min"
+        hours > 0 -> "${hours}h"
+        else -> "${minutes.coerceAtLeast(1)}min"
     }
 }
 

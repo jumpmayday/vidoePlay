@@ -28,6 +28,9 @@ interface DownloadTaskDao {
     )
     suspend fun nextQueued(limit: Int): List<DownloadTaskEntity>
 
+    @Query("SELECT * FROM download_tasks WHERE status = 'RUNNING'")
+    suspend fun getRunning(): List<DownloadTaskEntity>
+
     @Query("SELECT COUNT(*) FROM download_tasks WHERE status = 'RUNNING'")
     suspend fun countRunning(): Int
 
