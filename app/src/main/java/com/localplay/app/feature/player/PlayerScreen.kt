@@ -51,6 +51,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.Download
@@ -269,11 +270,16 @@ private fun PlayerScreenContent(
     SideEffect { currentIndexRef.set(currentIndex) }
 
     val downloadFinished = remember(path) { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val expectedTotalBytes = remember(path) { java.util.concurrent.atomic.AtomicLong(-1L) }
+    val lastKnownPositionMs = remember(path) { java.util.concurrent.atomic.AtomicLong(0L) }
     val growingFile = remember(path, initialVideo.uri) {
         com.localplay.app.core.download.DownloadPlayback.growingFileFor(path)
     }
+    // Once the download completes we re-point playback at the fully-written final file
+    // (a proper seek map exists there), so the progress bar / seek gestures work reliably.
+    var finalPlayUri by remember(path) { mutableStateOf<String?>(null) }
 
-    val exoPlayer = remember(initialVideo.uri, growingFile?.absolutePath) {
+    val exoPlayer = remember(initialVideo.uri, growingFile?.absolutePath, finalPlayUri) {
         val referer = com.localplay.app.core.download.DownloadPlayback.refererForPath(path)
         val httpFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
             .setUserAgent(
@@ -290,17 +296,22 @@ private fun PlayerScreenContent(
         }
         val httpDataSourceFactory =
             androidx.media3.datasource.DefaultDataSource.Factory(context, httpFactory)
-        val dataSourceFactory = if (growingFile != null && growingFile.exists()) {
-            com.localplay.app.core.download.GrowingFileDataSource.Factory(growingFile, downloadFinished)
+        val useGrowing = finalPlayUri == null && growingFile != null && growingFile.exists()
+        val dataSourceFactory = if (useGrowing) {
+            com.localplay.app.core.download.GrowingFileDataSource.Factory(
+                growingFile!!,
+                downloadFinished,
+                expectedTotalBytes
+            )
         } else {
             httpDataSourceFactory
         }
         val mediaSourceFactory =
             androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSourceFactory)
-        val playUri = if (growingFile != null && growingFile.exists()) {
-            android.net.Uri.fromFile(growingFile)
-        } else {
-            android.net.Uri.parse(initialVideo.uri)
+        val playUri = when {
+            finalPlayUri != null -> android.net.Uri.parse(finalPlayUri)
+            useGrowing -> android.net.Uri.fromFile(growingFile!!)
+            else -> android.net.Uri.parse(initialVideo.uri)
         }
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(mediaSourceFactory)
@@ -309,7 +320,11 @@ private fun PlayerScreenContent(
                 setMediaItem(MediaItem.fromUri(playUri))
                 playWhenReady = true
                 prepare()
-                val startPos = if (fromStart) 0L else initialVideo.progressMs
+                val startPos = when {
+                    finalPlayUri != null -> lastKnownPositionMs.get()
+                    fromStart -> 0L
+                    else -> initialVideo.progressMs
+                }
                 if (startPos > 0L) seekTo(startPos)
             }
     }
@@ -318,13 +333,25 @@ private fun PlayerScreenContent(
         val taskId = com.localplay.app.core.download.DownloadPlayback.taskIdFromPath(path)
         if (taskId != null) {
             val downloadRepo = LocalPlayApp.instance.downloadRepository
+            val wasGrowing = growingFile != null
             while (true) {
                 val task = downloadRepo.getTask(taskId)
+                if (task != null && task.totalBytes > 0L) {
+                    expectedTotalBytes.set(task.totalBytes)
+                }
                 val done = task == null ||
                     task.status == com.localplay.app.core.database.DownloadStatus.COMPLETED ||
                     task.status == com.localplay.app.core.database.DownloadStatus.FAILED
                 downloadFinished.set(done)
-                if (done) break
+                if (done) {
+                    if (wasGrowing &&
+                        task?.status == com.localplay.app.core.database.DownloadStatus.COMPLETED &&
+                        task.outputUri.isNotBlank()
+                    ) {
+                        finalPlayUri = task.outputUri
+                    }
+                    break
+                }
                 delay(400L)
             }
         } else {
@@ -358,7 +385,7 @@ private fun PlayerScreenContent(
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, exoPlayer) {
+    DisposableEffect(lifecycleOwner, exoPlayer, path) {
         var resumeWhenVisible = false
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -424,7 +451,7 @@ private fun PlayerScreenContent(
 
     val switchToLatest by rememberUpdatedState<(Int) -> Unit> { index -> switchTo(index) }
 
-    DisposableEffect(Unit) {
+    DisposableEffect(exoPlayer) {
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         val window = activity?.window
         if (window != null) {
@@ -468,6 +495,7 @@ private fun PlayerScreenContent(
     LaunchedEffect(exoPlayer) {
         while (true) {
             positionMs = exoPlayer.currentPosition
+            if (positionMs > 0L) lastKnownPositionMs.set(positionMs)
             delay(500L)
             if (positionMs > 0L && positionMs % 5_000L < 600L) persistProgress()
         }
@@ -537,6 +565,29 @@ private fun PlayerScreenContent(
             } catch (e: Exception) {
                 statusMessage = "截图失败：" + (e.message ?: "未知错误")
             }
+        }
+    }
+
+    fun launchCast() {
+        controlsVisible = true
+        val intents = listOf(
+            Intent("android.settings.CAST_SETTINGS"),
+            Intent("android.settings.WIFI_DISPLAY_SETTINGS"),
+            Intent(android.provider.Settings.ACTION_WIRELESS_SETTINGS)
+        )
+        val opened = intents.any { intent ->
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+        statusMessage = if (opened) {
+            "已打开投屏/无线显示，请选择设备"
+        } else {
+            "当前设备不支持系统投屏"
         }
     }
 
@@ -745,7 +796,8 @@ private fun PlayerScreenContent(
                 onDownloads = {
                     showDownloads = true
                     controlsVisible = true
-                }
+                },
+                onCast = { launchCast() }
             )
             BottomControls(
                 modifier = Modifier.align(Alignment.BottomCenter),
@@ -979,7 +1031,8 @@ private fun TopBar(
     activeDownloadCount: Int,
     onBack: () -> Unit,
     onPlaylist: () -> Unit,
-    onDownloads: () -> Unit
+    onDownloads: () -> Unit,
+    onCast: () -> Unit
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(top = 36.dp, start = 8.dp, end = 8.dp),
@@ -997,6 +1050,9 @@ private fun TopBar(
                 color = LpText
             )
             Text(video.folderName, style = LocalPlayTypography.labelSmall, color = LpText2)
+        }
+        IconButton(onClick = onCast) {
+            Icon(Icons.Default.Cast, contentDescription = "投屏", tint = LpText)
         }
         IconButton(onClick = onDownloads) {
             Box {

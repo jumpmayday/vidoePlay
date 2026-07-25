@@ -233,6 +233,23 @@ class ChallengedHttpClient(
         }
     }
 
+    /** Fetch raw bytes (used for HLS AES-128 keys / small segments). */
+    fun getBytes(url: String, referer: String? = null): ByteArray {
+        val builder = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
+        if (!referer.isNullOrBlank()) {
+            builder.header("Referer", referer)
+        }
+        client.newCall(builder.get().build()).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("请求失败 HTTP ${response.code}")
+            }
+            return response.body?.bytes() ?: ByteArray(0)
+        }
+    }
+
     private fun applyDocumentCookie(pageUrl: String, cookieAssign: String) {
         val httpUrl = pageUrl.toHttpUrlOrNull() ?: return
         val first = cookieAssign.split(";").firstOrNull().orEmpty()

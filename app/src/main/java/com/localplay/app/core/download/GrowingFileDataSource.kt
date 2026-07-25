@@ -8,6 +8,7 @@ import androidx.media3.datasource.DataSpec
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Reads a file that may still be growing (download in progress).
@@ -15,7 +16,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class GrowingFileDataSource(
     private val file: File,
-    private val isFinished: () -> Boolean
+    private val isFinished: () -> Boolean,
+    /** Expected final size in bytes, or <= 0 when unknown. Enables seeking during 边下边播. */
+    private val expectedTotal: () -> Long = { -1L }
 ) : BaseDataSource(/* isNetwork= */ false) {
 
     private var randomAccessFile: RandomAccessFile? = null
@@ -29,10 +32,18 @@ class GrowingFileDataSource(
         val raf = RandomAccessFile(file, "r")
         randomAccessFile = raf
         raf.seek(dataSpec.position)
-        bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
-            dataSpec.length
-        } else {
-            C.LENGTH_UNSET.toLong()
+        bytesRemaining = when {
+            dataSpec.length != C.LENGTH_UNSET.toLong() -> dataSpec.length
+            else -> {
+                // Report full remaining length so the extractor builds a seek map and the
+                // player exposes a seekable timeline while the file is still downloading.
+                val total = expectedTotal()
+                if (total > 0L && total > dataSpec.position) {
+                    total - dataSpec.position
+                } else {
+                    C.LENGTH_UNSET.toLong()
+                }
+            }
         }
         opened = true
         transferStarted(dataSpec)
@@ -112,10 +123,15 @@ class GrowingFileDataSource(
 
     class Factory(
         private val file: File,
-        private val finishedFlag: AtomicBoolean
+        private val finishedFlag: AtomicBoolean,
+        private val expectedTotal: AtomicLong = AtomicLong(-1L)
     ) : DataSource.Factory {
         override fun createDataSource(): DataSource {
-            return GrowingFileDataSource(file) { finishedFlag.get() }
+            return GrowingFileDataSource(
+                file,
+                { finishedFlag.get() },
+                { expectedTotal.get() }
+            )
         }
     }
 

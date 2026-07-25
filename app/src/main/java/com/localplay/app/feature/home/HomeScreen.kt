@@ -1,5 +1,8 @@
 package com.localplay.app.feature.home
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -86,6 +89,20 @@ fun HomeScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     var sortMenuExpanded by remember { mutableStateOf(false) }
     var moreMenuExpanded by remember { mutableStateOf(false) }
+
+    val deleteLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        viewModel.onSystemDeleteResult(
+            confirmed = result.resultCode == android.app.Activity.RESULT_OK
+        )
+    }
+    LaunchedEffect(state.deleteRequest) {
+        state.deleteRequest?.let { sender ->
+            deleteLauncher.launch(IntentSenderRequest.Builder(sender).build())
+            viewModel.onDeleteRequestConsumed()
+        }
+    }
 
     LaunchedEffect(Unit) { viewModel.refreshOnLaunch() }
 

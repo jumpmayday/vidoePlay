@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.localplay.app.LocalPlayApp
 import com.localplay.app.data.model.FolderGroup
 import com.localplay.app.data.model.SortOption
+import com.localplay.app.data.model.VideoItem
 import com.localplay.app.data.repository.VideoRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -25,7 +26,8 @@ data class HomeUiState(
     val totalCount: Int = 0,
     val selectionMode: Boolean = false,
     val selectedKeys: Set<String> = emptySet(),
-    val pendingBatchDelete: Boolean = false
+    val pendingBatchDelete: Boolean = false,
+    val deleteRequest: android.content.IntentSender? = null
 )
 
 class HomeViewModel(
@@ -34,12 +36,15 @@ class HomeViewModel(
 
     private val extras = MutableStateFlow(HomeExtras())
 
+    private var pendingSystemDelete: List<VideoItem> = emptyList()
+
     private data class HomeExtras(
         val query: String = "",
         val sortOption: SortOption = SortOption.DATE_MODIFIED,
         val selectionMode: Boolean = false,
         val selectedKeys: Set<String> = emptySet(),
-        val pendingBatchDelete: Boolean = false
+        val pendingBatchDelete: Boolean = false,
+        val deleteRequest: android.content.IntentSender? = null
     )
 
     val uiState: StateFlow<HomeUiState> = combine(
@@ -58,7 +63,8 @@ class HomeViewModel(
             totalCount = folders.sumOf { it.videos.size },
             selectionMode = extra.selectionMode,
             selectedKeys = extra.selectedKeys,
-            pendingBatchDelete = extra.pendingBatchDelete
+            pendingBatchDelete = extra.pendingBatchDelete,
+            deleteRequest = extra.deleteRequest
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), HomeUiState())
 
@@ -121,7 +127,7 @@ class HomeViewModel(
         if (keys.isEmpty()) return
         viewModelScope.launch {
             val videos = keys.flatMap { key -> repository.videosInFolder(key) }
-            repository.deleteVideos(videos)
+            val result = repository.deleteVideosWithPrompt(videos)
             extras.update {
                 it.copy(
                     selectionMode = false,
@@ -129,6 +135,25 @@ class HomeViewModel(
                     pendingBatchDelete = false
                 )
             }
+            when (result) {
+                is VideoRepository.DeleteResult.Completed -> pendingSystemDelete = emptyList()
+                is VideoRepository.DeleteResult.NeedsPermission -> {
+                    pendingSystemDelete = result.videos
+                    extras.update { it.copy(deleteRequest = result.intentSender) }
+                }
+            }
+        }
+    }
+
+    fun onDeleteRequestConsumed() {
+        extras.update { it.copy(deleteRequest = null) }
+    }
+
+    fun onSystemDeleteResult(confirmed: Boolean) {
+        val videos = pendingSystemDelete
+        pendingSystemDelete = emptyList()
+        if (confirmed && videos.isNotEmpty()) {
+            viewModelScope.launch { repository.onSystemDeleteConfirmed(videos) }
         }
     }
 

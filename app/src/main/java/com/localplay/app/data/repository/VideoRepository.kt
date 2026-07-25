@@ -288,6 +288,101 @@ class VideoRepository(
         return deletedCount
     }
 
+    sealed class DeleteResult {
+        data class Completed(val deleted: Int) : DeleteResult()
+        data class NeedsPermission(
+            val intentSender: android.content.IntentSender,
+            val videos: List<VideoItem>
+        ) : DeleteResult()
+    }
+
+    /**
+     * Delete media, falling back to a system confirmation dialog for files this app does not
+     * own (required on Android 10+). Directly-deletable files (e.g. app downloads) are removed
+     * immediately; the rest are returned as an [IntentSender] the UI must launch.
+     */
+    suspend fun deleteVideosWithPrompt(videos: List<VideoItem>): DeleteResult {
+        if (videos.isEmpty()) return DeleteResult.Completed(0)
+        val resolver = appContext.contentResolver
+        val needsPermission = mutableListOf<VideoItem>()
+        val recoverableSenders = mutableListOf<android.content.IntentSender>()
+        var deleted = 0
+
+        videos.forEach { video ->
+            val uri = try {
+                Uri.parse(video.uri)
+            } catch (_: Exception) {
+                null
+            }
+            if (uri == null) {
+                removeFromCache(video.path)
+                return@forEach
+            }
+            try {
+                if (resolver.delete(uri, null, null) > 0) {
+                    progressDao.deleteByPath(video.path)
+                    removeFromCache(video.path)
+                    deleted++
+                } else {
+                    needsPermission += video
+                }
+            } catch (security: SecurityException) {
+                if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q &&
+                    security is android.app.RecoverableSecurityException
+                ) {
+                    recoverableSenders += security.userAction.actionIntent.intentSender
+                    needsPermission += video
+                } else {
+                    needsPermission += video
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "deleteVideosWithPrompt failed: ${video.path}", e)
+            }
+        }
+
+        if (deleted > 0) rebuildFolders()
+
+        if (needsPermission.isEmpty()) {
+            return DeleteResult.Completed(deleted)
+        }
+
+        return when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                val uris = needsPermission.mapNotNull {
+                    try {
+                        Uri.parse(it.uri)
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                if (uris.isEmpty()) {
+                    DeleteResult.Completed(deleted)
+                } else {
+                    val pending = MediaStore.createDeleteRequest(resolver, uris)
+                    DeleteResult.NeedsPermission(pending.intentSender, needsPermission)
+                }
+            }
+            recoverableSenders.isNotEmpty() ->
+                DeleteResult.NeedsPermission(recoverableSenders.first(), needsPermission)
+            else -> DeleteResult.Completed(deleted)
+        }
+    }
+
+    /** Finalize deletions the user approved via the system dialog. */
+    suspend fun onSystemDeleteConfirmed(videos: List<VideoItem>) {
+        videos.forEach { video ->
+            progressDao.deleteByPath(video.path)
+            removeFromCache(video.path)
+        }
+        rebuildFolders()
+        // Re-sync with MediaStore so any partially-applied deletions are reflected.
+        refresh(force = true)
+    }
+
+    private fun removeFromCache(path: String) {
+        cachedVideos = cachedVideos.filterNot { it.path == path }
+    }
+
     private fun rebuildFolders() {
         val filtered = cachedVideos.filter { video ->
             query.isBlank() ||

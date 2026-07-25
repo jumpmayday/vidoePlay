@@ -25,6 +25,9 @@ import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 class DownloadAbortedException : Exception("download aborted")
 
@@ -295,7 +298,8 @@ class ResumableDownloadEngine(
 
         val mediaPlaylistUrl = resolveMediaPlaylist(current.mediaUrl, current.pageUrl)
         val playlist = http.getText(mediaPlaylistUrl, referer = current.pageUrl.ifBlank { null })
-        val segments = parseSegments(mediaPlaylistUrl, playlist)
+        val media = parseMedia(mediaPlaylistUrl, playlist)
+        val segments = media.segments
         if (segments.isEmpty()) {
             throw IllegalStateException("m3u8 未找到分片")
         }
@@ -316,12 +320,14 @@ class ResumableDownloadEngine(
             partial.delete()
         }
 
-        downloadHlsParallel(current, partial, segments, shouldAbort) { updated ->
+        downloadHlsParallel(current, partial, media, shouldAbort) { updated ->
             current = updated
             onProgress(current)
         }
 
-        val outputUri = publishFinal(partial, current.fileName, current.treeUri, "video/mp2t")
+        // fMP4 HLS (EXT-X-MAP) is an MP4 container; classic HLS is MPEG-TS.
+        val hlsMime = if (media.initUrl != null) "video/mp4" else "video/mp2t"
+        val outputUri = publishFinal(partial, current.fileName, current.treeUri, hlsMime)
         // Keep partial for in-flight 边下边播 readers; cleaned on restart/cancel.
         return current.copy(
             status = DownloadStatus.COMPLETED,
@@ -342,10 +348,11 @@ class ResumableDownloadEngine(
     private fun downloadHlsParallel(
         task: DownloadTaskEntity,
         partial: File,
-        segments: List<String>,
+        media: HlsMedia,
         shouldAbort: () -> Boolean,
         onProgress: (DownloadTaskEntity) -> Unit
     ) {
+        val segments = media.segments
         val referer = task.pageUrl.ifBlank { null }
         val startIndex = task.hlsSegmentIndex
         val parallelism = HLS_SEGMENT_PARALLEL
@@ -353,12 +360,20 @@ class ResumableDownloadEngine(
             if (exists()) deleteRecursively()
             mkdirs()
         }
+        val keyCache = ConcurrentHashMap<String, ByteArray>()
         val pool = Executors.newFixedThreadPool(parallelism)
         val ready = ConcurrentHashMap<Int, File>()
         val latchByIndex = ConcurrentHashMap<Int, CountDownLatch>()
         var current = task
         try {
             FileOutputStream(partial, startIndex > 0).use { output ->
+                // fMP4 init segment must precede the media segments.
+                if (startIndex == 0 && media.initUrl != null) {
+                    checkAbort(shouldAbort)
+                    val initBytes = http.getBytes(media.initUrl, referer)
+                    output.write(initBytes)
+                    output.flush()
+                }
                 var nextToWrite = startIndex
                 var fetchCursor = startIndex
                 val inflight = ArrayList<Future<*>>()
@@ -371,15 +386,16 @@ class ResumableDownloadEngine(
                     ensureLatch(index)
                     return pool.submit {
                         checkAbort(shouldAbort)
-                        val tmp = File(segDir, "$index.ts")
-                        FileOutputStream(tmp).use { out ->
-                            http.copyTo(
-                                url = segments[index],
-                                output = out,
-                                referer = referer,
-                                startByte = 0L
-                            )
+                        val seg = segments[index]
+                        var bytes = http.getBytes(seg.url, referer)
+                        if (seg.keyUri != null && seg.iv != null) {
+                            val keyBytes = keyCache.getOrPut(seg.keyUri) {
+                                http.getBytes(seg.keyUri, referer)
+                            }
+                            bytes = decryptAes128(bytes, keyBytes, seg.iv)
                         }
+                        val tmp = File(segDir, "$index.ts")
+                        FileOutputStream(tmp).use { out -> out.write(bytes) }
                         ready[index] = tmp
                         ensureLatch(index).countDown()
                     }
@@ -565,11 +581,102 @@ class ResumableDownloadEngine(
         return bestUrl ?: url
     }
 
-    private fun parseSegments(playlistUrl: String, playlist: String): List<String> {
-        return playlist.lines()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && !it.startsWith("#") }
-            .map { absolutize(playlistUrl, it) }
+    private data class HlsSeg(
+        val url: String,
+        val keyUri: String?,
+        val iv: ByteArray?
+    )
+
+    private data class HlsMedia(
+        val initUrl: String?,
+        val segments: List<HlsSeg>
+    )
+
+    /**
+     * Parse a media playlist, resolving AES-128 encryption keys/IVs and the optional fMP4
+     * init segment. Encrypted segments carry the resolved key URI + IV so the downloader can
+     * decrypt them (otherwise the merged .ts is unplayable garbage).
+     */
+    private fun parseMedia(playlistUrl: String, playlist: String): HlsMedia {
+        var seq = 0L
+        var curKeyUri: String? = null
+        var curKeyIvHex: String? = null
+        var initUrl: String? = null
+        val segs = ArrayList<HlsSeg>()
+
+        playlist.lines().map { it.trim() }.forEach { line ->
+            when {
+                line.isEmpty() -> Unit
+                line.startsWith("#EXT-X-MEDIA-SEQUENCE:") -> {
+                    seq = line.substringAfter(':').trim().toLongOrNull() ?: 0L
+                }
+                line.startsWith("#EXT-X-KEY:") -> {
+                    val method = attr(line, "METHOD")?.uppercase()
+                    if (method == null || method == "NONE") {
+                        curKeyUri = null
+                        curKeyIvHex = null
+                    } else {
+                        curKeyUri = attr(line, "URI")?.let { absolutize(playlistUrl, it) }
+                        curKeyIvHex = attr(line, "IV")
+                    }
+                }
+                line.startsWith("#EXT-X-MAP:") -> {
+                    initUrl = attr(line, "URI")?.let { absolutize(playlistUrl, it) }
+                }
+                line.startsWith("#") -> Unit
+                else -> {
+                    val url = absolutize(playlistUrl, line)
+                    val keyUri = curKeyUri
+                    val iv = if (keyUri != null) {
+                        curKeyIvHex?.let { hexToBytes(it) } ?: seqToIv(seq)
+                    } else {
+                        null
+                    }
+                    segs += HlsSeg(url, keyUri, iv)
+                    seq++
+                }
+            }
+        }
+        return HlsMedia(initUrl, segs)
+    }
+
+    private fun attr(line: String, name: String): String? {
+        val m = Regex("""$name=("([^"]*)"|[^,\s]+)""").find(line) ?: return null
+        return (m.groupValues[2].ifEmpty { m.groupValues[1] }).trim()
+    }
+
+    private fun hexToBytes(hex: String): ByteArray {
+        val clean = hex.removePrefix("0x").removePrefix("0X")
+        val padded = if (clean.length % 2 == 0) clean else "0$clean"
+        return ByteArray(padded.length / 2) { i ->
+            padded.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    private fun seqToIv(seq: Long): ByteArray {
+        val iv = ByteArray(16)
+        var value = seq
+        for (i in 15 downTo 8) {
+            iv[i] = (value and 0xFF).toByte()
+            value = value shr 8
+        }
+        return iv
+    }
+
+    private fun decryptAes128(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
+        val keySpec = SecretKeySpec(key.copyOf(16), "AES")
+        val ivSpec = IvParameterSpec(iv.copyOf(16))
+        return try {
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
+            cipher.doFinal(data)
+        } catch (e: Exception) {
+            // Some CDNs pre-pad to a block boundary; retry without padding stripping.
+            val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
+            val aligned = if (data.size % 16 == 0) data else data.copyOf(data.size - data.size % 16)
+            cipher.doFinal(aligned)
+        }
     }
 
     private fun absolutize(baseUrl: String, href: String): String {

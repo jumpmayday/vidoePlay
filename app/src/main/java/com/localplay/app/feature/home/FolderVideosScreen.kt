@@ -1,5 +1,8 @@
 package com.localplay.app.feature.home
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -32,6 +35,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -39,7 +43,9 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -70,6 +76,7 @@ import com.localplay.app.ui.theme.LpText2
 import com.localplay.app.ui.theme.LpText3
 import com.localplay.app.ui.theme.LocalPlayTypography
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FolderVideosScreen(
     folderKey: String,
@@ -83,6 +90,20 @@ fun FolderVideosScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     var moreMenuExpanded by remember { mutableStateOf(false) }
     val title = state.folder?.name ?: "文件夹"
+
+    val deleteLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        viewModel.onSystemDeleteResult(
+            confirmed = result.resultCode == android.app.Activity.RESULT_OK
+        )
+    }
+    LaunchedEffect(state.deleteRequest) {
+        state.deleteRequest?.let { sender ->
+            deleteLauncher.launch(IntentSenderRequest.Builder(sender).build())
+            viewModel.onDeleteRequestConsumed()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -179,39 +200,56 @@ fun FolderVideosScreen(
             )
         }
 
-        if (state.videos.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("该目录暂无视频", color = LpText2)
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(bottom = 24.dp)
-            ) {
-                items(state.videos, key = { it.path }) { video ->
-                    VideoRow(
-                        video = video,
-                        selectionMode = state.selectionMode,
-                        selected = video.path in state.selectedPaths,
-                        onClick = {
-                            if (state.selectionMode) {
-                                viewModel.toggleSelected(video.path)
-                            } else {
-                                viewModel.onVideoClick(video, askResume = true) { item, fromStart ->
-                                    onOpenPlayer(item.path, fromStart)
+        PullToRefreshBox(
+            isRefreshing = state.refreshing,
+            onRefresh = viewModel::refresh,
+            modifier = Modifier.fillMaxSize()
+        ) {
+            if (state.videos.isEmpty()) {
+                LazyColumn(modifier = Modifier.fillMaxSize()) {
+                    item {
+                        Box(
+                            modifier = Modifier
+                                .fillParentMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                if (state.refreshing) "正在刷新…" else "该目录暂无视频（下拉刷新）",
+                                color = LpText2
+                            )
+                        }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(bottom = 24.dp)
+                ) {
+                    items(state.videos, key = { it.path }) { video ->
+                        VideoRow(
+                            video = video,
+                            selectionMode = state.selectionMode,
+                            selected = video.path in state.selectedPaths,
+                            onClick = {
+                                if (state.selectionMode) {
+                                    viewModel.toggleSelected(video.path)
+                                } else {
+                                    viewModel.onVideoClick(video, askResume = true) { item, fromStart ->
+                                        onOpenPlayer(item.path, fromStart)
+                                    }
                                 }
-                            }
-                        },
-                        onLongClick = {
-                            if (state.selectionMode) {
-                                viewModel.toggleSelected(video.path)
-                            } else {
-                                viewModel.enterSelectionMode(video.path)
-                            }
-                        },
-                        onMore = { viewModel.openContextMenu(video) },
-                        onToggleSelect = { viewModel.toggleSelected(video.path) }
-                    )
+                            },
+                            onLongClick = {
+                                if (state.selectionMode) {
+                                    viewModel.toggleSelected(video.path)
+                                } else {
+                                    viewModel.enterSelectionMode(video.path)
+                                }
+                            },
+                            onMore = { viewModel.openContextMenu(video) },
+                            onToggleSelect = { viewModel.toggleSelected(video.path) }
+                        )
+                    }
                 }
             }
         }

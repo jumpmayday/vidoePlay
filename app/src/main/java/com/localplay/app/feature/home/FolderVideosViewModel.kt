@@ -20,12 +20,14 @@ data class FolderVideosUiState(
     val folder: FolderGroup? = null,
     val videos: List<VideoItem> = emptyList(),
     val query: String = "",
+    val refreshing: Boolean = false,
     val selectionMode: Boolean = false,
     val selectedPaths: Set<String> = emptySet(),
     val pendingDelete: VideoItem? = null,
     val pendingBatchDelete: Boolean = false,
     val resumeTarget: VideoItem? = null,
-    val contextMenuVideo: VideoItem? = null
+    val contextMenuVideo: VideoItem? = null,
+    val deleteRequest: android.content.IntentSender? = null
 )
 
 class FolderVideosViewModel(
@@ -35,6 +37,9 @@ class FolderVideosViewModel(
 
     private val extras = MutableStateFlow(Extras())
 
+    // Videos awaiting a system delete-confirmation result (Android 11+ non-owned media).
+    private var pendingSystemDelete: List<VideoItem> = emptyList()
+
     private data class Extras(
         val query: String = "",
         val selectionMode: Boolean = false,
@@ -42,13 +47,15 @@ class FolderVideosViewModel(
         val pendingDelete: VideoItem? = null,
         val pendingBatchDelete: Boolean = false,
         val resumeTarget: VideoItem? = null,
-        val contextMenuVideo: VideoItem? = null
+        val contextMenuVideo: VideoItem? = null,
+        val deleteRequest: android.content.IntentSender? = null
     )
 
     val uiState: StateFlow<FolderVideosUiState> = combine(
         repository.folders.map { list -> list.firstOrNull { it.key == folderKey } },
+        repository.scanning,
         extras
-    ) { folder, extra ->
+    ) { folder, scanning, extra ->
         val all = folder?.videos.orEmpty()
         val filtered = if (extra.query.isBlank()) {
             all
@@ -59,14 +66,20 @@ class FolderVideosViewModel(
             folder = folder,
             videos = filtered,
             query = extra.query,
+            refreshing = scanning,
             selectionMode = extra.selectionMode,
             selectedPaths = extra.selectedPaths,
             pendingDelete = extra.pendingDelete,
             pendingBatchDelete = extra.pendingBatchDelete,
             resumeTarget = extra.resumeTarget,
-            contextMenuVideo = extra.contextMenuVideo
+            contextMenuVideo = extra.contextMenuVideo,
+            deleteRequest = extra.deleteRequest
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), FolderVideosUiState())
+
+    fun refresh() {
+        viewModelScope.launch { repository.refresh(force = true) }
+    }
 
     fun onQueryChange(value: String) {
         extras.update { it.copy(query = value) }
@@ -123,8 +136,9 @@ class FolderVideosViewModel(
     fun confirmDelete() {
         val target = extras.value.pendingDelete ?: return
         viewModelScope.launch {
-            repository.deleteVideo(target)
+            val result = repository.deleteVideosWithPrompt(listOf(target))
             extras.update { it.copy(pendingDelete = null) }
+            handleDeleteResult(result)
         }
     }
 
@@ -142,7 +156,7 @@ class FolderVideosViewModel(
         if (paths.isEmpty()) return
         viewModelScope.launch {
             val videos = uiState.value.videos.filter { it.path in paths }
-            repository.deleteVideos(videos)
+            val result = repository.deleteVideosWithPrompt(videos)
             extras.update {
                 it.copy(
                     selectionMode = false,
@@ -150,6 +164,31 @@ class FolderVideosViewModel(
                     pendingBatchDelete = false
                 )
             }
+            handleDeleteResult(result)
+        }
+    }
+
+    private fun handleDeleteResult(result: VideoRepository.DeleteResult) {
+        when (result) {
+            is VideoRepository.DeleteResult.Completed -> pendingSystemDelete = emptyList()
+            is VideoRepository.DeleteResult.NeedsPermission -> {
+                pendingSystemDelete = result.videos
+                extras.update { it.copy(deleteRequest = result.intentSender) }
+            }
+        }
+    }
+
+    /** Called after the composable launches the system delete dialog. */
+    fun onDeleteRequestConsumed() {
+        extras.update { it.copy(deleteRequest = null) }
+    }
+
+    /** Called with the result of the system delete-confirmation dialog. */
+    fun onSystemDeleteResult(confirmed: Boolean) {
+        val videos = pendingSystemDelete
+        pendingSystemDelete = emptyList()
+        if (confirmed && videos.isNotEmpty()) {
+            viewModelScope.launch { repository.onSystemDeleteConfirmed(videos) }
         }
     }
 
