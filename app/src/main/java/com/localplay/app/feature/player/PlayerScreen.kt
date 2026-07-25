@@ -17,6 +17,7 @@ import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.ui.graphics.asImageBitmap
 import com.localplay.app.core.media.ScreenshotSaver
@@ -554,7 +555,17 @@ private fun PlayerScreenContent(
         }
         scope.launch {
             try {
-                statusMessage = "正在截图…"
+                // Hide chrome so PixelCopy / overlay capture only sees the video frame.
+                controlsVisible = false
+                showTools = false
+                showPlaylist = false
+                showDownloads = false
+                brightnessHint = null
+                volumeHint = null
+                seekHint = null
+                statusMessage = null
+                screenshotPreview = null
+                delay(80L)
                 val result = ScreenshotSaver.captureAndSave(
                     context = context,
                     playerView = view,
@@ -680,14 +691,7 @@ private fun PlayerScreenContent(
                                         (change.position.y - lastTapY).toDouble()
                                     ) < touchSlopPx * 2
                                 if (isDoubleTap) {
-                                    val seekBy = 10_000L
-                                    if (change.position.x < width / 2f) {
-                                        exoPlayer.seekTo((exoPlayer.currentPosition - seekBy).coerceAtLeast(0L))
-                                    } else {
-                                        exoPlayer.seekTo(
-                                            (exoPlayer.currentPosition + seekBy).coerceAtMost(duration)
-                                        )
-                                    }
+                                    if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
                                     controlsVisible = true
                                     lastTapAt = 0L
                                 } else {
@@ -859,6 +863,31 @@ private fun PlayerScreenContent(
             }
         }
 
+        if (controlsVisible && !locked && !clipMode) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                IconButton(
+                    onClick = { takeScreenshot() },
+                    modifier = Modifier.background(Color.Black.copy(alpha = 0.35f), CircleShape)
+                ) {
+                    Icon(
+                        Icons.Default.CameraAlt,
+                        contentDescription = "截图",
+                        tint = Color.White
+                    )
+                }
+                Text(
+                    "截图",
+                    color = Color.White.copy(alpha = 0.9f),
+                    style = LocalPlayTypography.labelSmall
+                )
+            }
+        }
+
         if (showTools) {
             ModalBottomSheet(
                 onDismissRequest = { showTools = false },
@@ -883,17 +912,6 @@ private fun PlayerScreenContent(
                         Icon(Icons.Default.ContentCut, null, tint = LpText)
                         Spacer(modifier = Modifier.size(8.dp))
                         Text("截取片段", color = LpText)
-                    }
-                    TextButton(
-                        onClick = {
-                            showTools = false
-                            takeScreenshot()
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Default.CameraAlt, null, tint = LpText)
-                        Spacer(modifier = Modifier.size(8.dp))
-                        Text("截图", color = LpText)
                     }
                     TextButton(
                         onClick = {
@@ -1550,6 +1568,7 @@ private fun compactDuration(ms: Long): String {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun BottomControls(
     modifier: Modifier = Modifier,
@@ -1565,23 +1584,45 @@ private fun BottomControls(
     onPlaylist: () -> Unit,
     onRotate: () -> Unit
 ) {
+    val seekInteraction = remember { MutableInteractionSource() }
+    val sliderColors = SliderDefaults.colors(
+        thumbColor = Color.White,
+        activeTrackColor = Color.White,
+        inactiveTrackColor = Color.White.copy(alpha = 0.28f)
+    )
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
+            .padding(horizontal = 18.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
     ) {
         Slider(
             value = if (durationMs <= 0L) 0f else (positionMs.toFloat() / durationMs).coerceIn(0f, 1f),
             onValueChange = { ratio -> onSeek((ratio * durationMs).toLong()) },
             modifier = Modifier
                 .fillMaxWidth()
-                .height(20.dp),
-            colors = SliderDefaults.colors(
-                thumbColor = Color.White,
-                activeTrackColor = Color.White,
-                inactiveTrackColor = Color.White.copy(alpha = 0.28f)
-            )
+                .height(14.dp),
+            colors = sliderColors,
+            interactionSource = seekInteraction,
+            thumb = {
+                SliderDefaults.Thumb(
+                    interactionSource = seekInteraction,
+                    colors = sliderColors,
+                    enabled = true,
+                    modifier = Modifier.size(10.dp)
+                )
+            },
+            track = { sliderState ->
+                SliderDefaults.Track(
+                    sliderState = sliderState,
+                    colors = sliderColors,
+                    enabled = true,
+                    modifier = Modifier.height(2.dp),
+                    drawStopIndicator = null,
+                    thumbTrackGapSize = 0.dp,
+                    trackInsideCornerSize = 0.dp
+                )
+            }
         )
         Row(
             modifier = Modifier.fillMaxWidth(),
