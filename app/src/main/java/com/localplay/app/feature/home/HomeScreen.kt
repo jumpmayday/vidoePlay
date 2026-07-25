@@ -253,6 +253,7 @@ private fun HomeTopBar(
         Box {
             RoundIconButton(Icons.Default.Sort, onSortClick)
             DropdownMenu(expanded = sortMenuExpanded, onDismissRequest = onDismissSort) {
+                DropdownMenuItem(text = { Text("按集数") }, onClick = { onSortSelected(SortOption.EPISODE) })
                 DropdownMenuItem(text = { Text("按名称") }, onClick = { onSortSelected(SortOption.NAME) })
                 DropdownMenuItem(text = { Text("按大小") }, onClick = { onSortSelected(SortOption.SIZE) })
                 DropdownMenuItem(text = { Text("按时长") }, onClick = { onSortSelected(SortOption.DURATION) })

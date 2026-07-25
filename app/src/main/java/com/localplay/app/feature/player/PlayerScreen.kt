@@ -59,12 +59,14 @@ import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Equalizer
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -245,6 +247,7 @@ private fun PlayerScreenContent(
     var showPlaylist by remember { mutableStateOf(false) }
     var playlistQuery by remember { mutableStateOf("") }
     var showDownloads by remember { mutableStateOf(false) }
+    var showTools by remember { mutableStateOf(false) }
     val downloadRepo = LocalPlayApp.instance.downloadRepository
     val downloadTasks by downloadRepo.tasks.collectAsState(initial = emptyList())
     val activeDownloadCount = remember(downloadTasks) {
@@ -501,8 +504,8 @@ private fun PlayerScreenContent(
         }
     }
 
-    LaunchedEffect(controlsVisible, locked, clipMode, showPlaylist, showDownloads) {
-        if (controlsVisible && !locked && !clipMode && !showPlaylist && !showDownloads) {
+    LaunchedEffect(controlsVisible, locked, clipMode, showPlaylist, showDownloads, showTools) {
+        if (controlsVisible && !locked && !clipMode && !showPlaylist && !showDownloads && !showTools) {
             delay(4_000L)
             controlsVisible = false
         }
@@ -797,7 +800,8 @@ private fun PlayerScreenContent(
                     showDownloads = true
                     controlsVisible = true
                 },
-                onCast = { launchCast() }
+                onCast = { launchCast() },
+                onMore = { showTools = true }
             )
             BottomControls(
                 modifier = Modifier.align(Alignment.BottomCenter),
@@ -810,8 +814,10 @@ private fun PlayerScreenContent(
                 onPrev = { switchTo(currentIndex - 1) },
                 onNext = { switchTo(currentIndex + 1) },
                 onSpeed = { showSpeedSheet = true },
-                onClip = { enterClipMode() },
-                onScreenshot = { takeScreenshot() },
+                onPlaylist = {
+                    showPlaylist = true
+                    controlsVisible = true
+                },
                 onRotate = {
                     activity?.let { act ->
                         act.requestedOrientation =
@@ -825,18 +831,83 @@ private fun PlayerScreenContent(
             )
         }
 
-        IconButton(
-            onClick = {
-                locked = !locked
-                controlsVisible = true
-            },
-            modifier = Modifier.align(Alignment.CenterStart).padding(12.dp).background(LpOverlay, CircleShape)
-        ) {
-            Icon(
-                if (locked) Icons.Default.Lock else Icons.Default.LockOpen,
-                contentDescription = "锁屏",
-                tint = LpText
-            )
+        if (controlsVisible || locked) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = 12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                IconButton(
+                    onClick = {
+                        locked = !locked
+                        controlsVisible = true
+                    },
+                    modifier = Modifier.background(Color.Black.copy(alpha = 0.35f), CircleShape)
+                ) {
+                    Icon(
+                        if (locked) Icons.Default.Lock else Icons.Default.LockOpen,
+                        contentDescription = "锁屏",
+                        tint = Color.White
+                    )
+                }
+                Text(
+                    if (locked) "解锁" else "锁屏",
+                    color = Color.White.copy(alpha = 0.9f),
+                    style = LocalPlayTypography.labelSmall
+                )
+            }
+        }
+
+        if (showTools) {
+            ModalBottomSheet(
+                onDismissRequest = { showTools = false },
+                sheetState = rememberModalBottomSheetState(),
+                containerColor = LpSurface
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp)
+                        .padding(bottom = 28.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("更多操作", style = LocalPlayTypography.titleMedium, color = LpText)
+                    TextButton(
+                        onClick = {
+                            showTools = false
+                            enterClipMode()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.ContentCut, null, tint = LpText)
+                        Spacer(modifier = Modifier.size(8.dp))
+                        Text("截取片段", color = LpText)
+                    }
+                    TextButton(
+                        onClick = {
+                            showTools = false
+                            takeScreenshot()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.CameraAlt, null, tint = LpText)
+                        Spacer(modifier = Modifier.size(8.dp))
+                        Text("截图", color = LpText)
+                    }
+                    TextButton(
+                        onClick = {
+                            showTools = false
+                            launchCast()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Cast, null, tint = LpText)
+                        Spacer(modifier = Modifier.size(8.dp))
+                        Text("投屏", color = LpText)
+                    }
+                }
+            }
         }
 
         brightnessHint?.let { value ->
@@ -1032,34 +1103,37 @@ private fun TopBar(
     onBack: () -> Unit,
     onPlaylist: () -> Unit,
     onDownloads: () -> Unit,
-    onCast: () -> Unit
+    onCast: () -> Unit,
+    onMore: () -> Unit
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(top = 36.dp, start = 8.dp, end = 8.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 28.dp, start = 4.dp, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         IconButton(onClick = onBack) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null, tint = LpText)
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null, tint = Color.White)
         }
-        Column(modifier = Modifier.weight(1f)) {
+        Column(modifier = Modifier.weight(1f).padding(end = 4.dp)) {
             Text(
                 video.displayName,
                 style = LocalPlayTypography.bodyLarge,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                color = LpText
+                color = Color.White
             )
-            Text(video.folderName, style = LocalPlayTypography.labelSmall, color = LpText2)
+            Text(video.folderName, style = LocalPlayTypography.labelSmall, color = Color.White.copy(alpha = 0.7f))
         }
         IconButton(onClick = onCast) {
-            Icon(Icons.Default.Cast, contentDescription = "投屏", tint = LpText)
+            Icon(Icons.Default.Cast, contentDescription = "投屏", tint = Color.White)
         }
         IconButton(onClick = onDownloads) {
             Box {
                 Icon(
                     Icons.Default.Download,
                     contentDescription = "嗅探下载",
-                    tint = if (activeDownloadCount > 0) LpPrimary else LpText
+                    tint = if (activeDownloadCount > 0) LpPrimary else Color.White
                 )
                 if (activeDownloadCount > 0) {
                     Text(
@@ -1078,16 +1152,18 @@ private fun TopBar(
             Icon(
                 Icons.AutoMirrored.Filled.PlaylistPlay,
                 contentDescription = "播放列表",
-                tint = LpText
+                tint = Color.White
             )
         }
         if (playlistCount > 1) {
             Text(
                 text = "${playlistCount}集",
-                color = LpText2,
-                style = LocalPlayTypography.labelSmall,
-                modifier = Modifier.padding(end = 4.dp)
+                color = Color.White.copy(alpha = 0.75f),
+                style = LocalPlayTypography.labelSmall
             )
+        }
+        IconButton(onClick = onMore) {
+            Icon(Icons.Default.MoreVert, contentDescription = "更多", tint = Color.White)
         }
     }
 }
@@ -1486,55 +1562,64 @@ private fun BottomControls(
     onPrev: () -> Unit,
     onNext: () -> Unit,
     onSpeed: () -> Unit,
-    onClip: () -> Unit,
-    onScreenshot: () -> Unit,
+    onPlaylist: () -> Unit,
     onRotate: () -> Unit
 ) {
     Column(
-        modifier = modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 18.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(Formatters.duration(positionMs), color = LpText, style = LocalPlayTypography.labelMedium)
-            Text(Formatters.duration(durationMs), color = LpText2, style = LocalPlayTypography.labelMedium)
-        }
         Slider(
             value = if (durationMs <= 0L) 0f else (positionMs.toFloat() / durationMs).coerceIn(0f, 1f),
             onValueChange = { ratio -> onSeek((ratio * durationMs).toLong()) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(20.dp),
             colors = SliderDefaults.colors(
-                thumbColor = LpPrimary,
-                activeTrackColor = LpPrimary,
-                inactiveTrackColor = LpSurface3
+                thumbColor = Color.White,
+                activeTrackColor = Color.White,
+                inactiveTrackColor = Color.White.copy(alpha = 0.28f)
             )
         )
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            ControlItem(Icons.Default.ContentCut, "截取", onClip)
-            ControlItem(Icons.Default.CameraAlt, "截图", onScreenshot)
-            ControlItem(Icons.Default.SkipPrevious, "上一集", onPrev)
-            IconButton(
-                onClick = onTogglePlay,
-                modifier = Modifier.size(48.dp).background(LpPrimary.copy(alpha = 0.2f), CircleShape)
-            ) {
+            IconButton(onClick = onTogglePlay, modifier = Modifier.size(44.dp)) {
                 Icon(
                     if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                     contentDescription = null,
-                    tint = LpText,
-                    modifier = Modifier.size(28.dp)
+                    tint = Color.White,
+                    modifier = Modifier.size(30.dp)
                 )
             }
-            ControlItem(Icons.Default.SkipNext, "下一集", onNext)
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.clickable(onClick = onSpeed)
-            ) {
-                Text(formatSpeed(speed), color = LpText, style = LocalPlayTypography.labelMedium)
-                Text("倍速", color = LpText2, style = LocalPlayTypography.labelSmall)
+            IconButton(onClick = onPrev, modifier = Modifier.size(40.dp)) {
+                Icon(Icons.Default.SkipPrevious, contentDescription = "上一集", tint = Color.White)
             }
-            ControlItem(Icons.Default.ScreenRotation, "旋转", onRotate)
+            IconButton(onClick = onNext, modifier = Modifier.size(40.dp)) {
+                Icon(Icons.Default.SkipNext, contentDescription = "下一集", tint = Color.White)
+            }
+            Text(
+                text = Formatters.duration(positionMs) + " / " + Formatters.duration(durationMs),
+                color = Color.White.copy(alpha = 0.9f),
+                style = LocalPlayTypography.labelMedium,
+                modifier = Modifier.padding(start = 2.dp)
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            TextButton(onClick = onPlaylist) {
+                Text("本地视频", color = Color.White)
+            }
+            TextButton(onClick = onSpeed) {
+                Text(
+                    if (abs(speed - 1f) < 0.01f) "倍速" else formatSpeed(speed),
+                    color = Color.White
+                )
+            }
+            IconButton(onClick = onRotate) {
+                Icon(Icons.Default.ScreenRotation, contentDescription = "旋转", tint = Color.White)
+            }
         }
     }
 }

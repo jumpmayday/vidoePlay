@@ -34,7 +34,10 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
+import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -62,7 +65,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.localplay.app.ui.components.VideoThumbnail
 import com.localplay.app.core.common.Formatters
+import com.localplay.app.data.model.SortOption
 import com.localplay.app.data.model.VideoItem
+import com.localplay.app.data.model.label
 import com.localplay.app.ui.theme.LpBg
 import com.localplay.app.ui.theme.LpDanger
 import com.localplay.app.ui.theme.LpOnPrimary
@@ -89,6 +94,7 @@ fun FolderVideosScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     var moreMenuExpanded by remember { mutableStateOf(false) }
+    var sortMenuExpanded by remember { mutableStateOf(false) }
     val title = state.folder?.name ?: "文件夹"
 
     val deleteLauncher = rememberLauncherForActivityResult(
@@ -154,20 +160,44 @@ fun FolderVideosScreen(
                 Column(modifier = Modifier.weight(1f)) {
                     Text(title, style = LocalPlayTypography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(
-                        "${state.folder?.videoCount ?: 0} 个视频",
+                        "${state.folder?.videoCount ?: 0} 个视频 · ${state.sortOption.label()}",
                         style = LocalPlayTypography.labelSmall,
                         color = LpText2
                     )
                 }
                 Box {
+                    IconButton(onClick = { sortMenuExpanded = true }) {
+                        Icon(Icons.Default.Sort, contentDescription = "排序", tint = LpText)
+                    }
+                    DropdownMenu(
+                        expanded = sortMenuExpanded,
+                        onDismissRequest = { sortMenuExpanded = false }
+                    ) {
+                        SortOption.entries.forEach { option ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        option.label(),
+                                        color = if (option == state.sortOption) LpPrimary else LpText
+                                    )
+                                },
+                                onClick = {
+                                    viewModel.onSortChange(option)
+                                    sortMenuExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+                Box {
                     IconButton(onClick = { moreMenuExpanded = true }) {
                         Icon(Icons.Default.MoreVert, contentDescription = "更多", tint = LpText)
                     }
-                    androidx.compose.material3.DropdownMenu(
+                    DropdownMenu(
                         expanded = moreMenuExpanded,
                         onDismissRequest = { moreMenuExpanded = false }
                     ) {
-                        androidx.compose.material3.DropdownMenuItem(
+                        DropdownMenuItem(
                             text = { Text("批量删除") },
                             onClick = {
                                 moreMenuExpanded = false

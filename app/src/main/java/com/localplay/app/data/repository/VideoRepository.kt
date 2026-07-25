@@ -12,6 +12,7 @@ import com.localplay.app.core.scanner.VideoScanner
 import com.localplay.app.data.model.FolderGroup
 import com.localplay.app.data.model.SortOption
 import com.localplay.app.data.model.VideoItem
+import com.localplay.app.data.model.sortedByOption
 import java.time.LocalDate
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -210,7 +211,7 @@ class VideoRepository(
         val current = findByPath(path) ?: return emptyList()
         return cachedVideos
             .filter { it.folderKey == current.folderKey }
-            .sortedBy { it.displayName.lowercase() }
+            .sortedByOption(SortOption.EPISODE)
     }
 
     suspend fun saveProgress(
@@ -389,12 +390,7 @@ class VideoRepository(
                 video.displayName.contains(query, ignoreCase = true) ||
                 video.folderName.contains(query, ignoreCase = true)
         }
-        val sorted = when (sortOption) {
-            SortOption.NAME -> filtered.sortedBy { it.displayName.lowercase() }
-            SortOption.SIZE -> filtered.sortedByDescending { it.sizeBytes }
-            SortOption.DURATION -> filtered.sortedByDescending { it.durationMs }
-            SortOption.DATE_MODIFIED -> filtered.sortedByDescending { it.dateModified }
-        }
+        val sorted = filtered.sortedByOption(sortOption)
         _folders.value = sorted
             .groupBy { it.folderKey }
             .entries

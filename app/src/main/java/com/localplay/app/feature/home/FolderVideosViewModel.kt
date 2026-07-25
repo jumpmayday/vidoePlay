@@ -5,7 +5,9 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.localplay.app.LocalPlayApp
 import com.localplay.app.data.model.FolderGroup
+import com.localplay.app.data.model.SortOption
 import com.localplay.app.data.model.VideoItem
+import com.localplay.app.data.model.sortedByOption
 import com.localplay.app.data.repository.VideoRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -20,6 +22,7 @@ data class FolderVideosUiState(
     val folder: FolderGroup? = null,
     val videos: List<VideoItem> = emptyList(),
     val query: String = "",
+    val sortOption: SortOption = SortOption.EPISODE,
     val refreshing: Boolean = false,
     val selectionMode: Boolean = false,
     val selectedPaths: Set<String> = emptySet(),
@@ -42,6 +45,7 @@ class FolderVideosViewModel(
 
     private data class Extras(
         val query: String = "",
+        val sortOption: SortOption = SortOption.EPISODE,
         val selectionMode: Boolean = false,
         val selectedPaths: Set<String> = emptySet(),
         val pendingDelete: VideoItem? = null,
@@ -64,8 +68,9 @@ class FolderVideosViewModel(
         }
         FolderVideosUiState(
             folder = folder,
-            videos = filtered,
+            videos = filtered.sortedByOption(extra.sortOption),
             query = extra.query,
+            sortOption = extra.sortOption,
             refreshing = scanning,
             selectionMode = extra.selectionMode,
             selectedPaths = extra.selectedPaths,
@@ -83,6 +88,10 @@ class FolderVideosViewModel(
 
     fun onQueryChange(value: String) {
         extras.update { it.copy(query = value) }
+    }
+
+    fun onSortChange(option: SortOption) {
+        extras.update { it.copy(sortOption = option) }
     }
 
     fun enterSelectionMode(initialPath: String? = null) {
