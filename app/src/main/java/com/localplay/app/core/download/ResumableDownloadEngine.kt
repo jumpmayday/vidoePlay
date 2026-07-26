@@ -303,8 +303,17 @@ class ResumableDownloadEngine(
         if (segments.isEmpty()) {
             throw IllegalStateException("m3u8 未找到分片")
         }
+        if (media.totalDurationSec < 60.0 && segments.size < 20) {
+            throw IllegalStateException(
+                "播放列表过短（约 ${media.totalDurationSec.toInt()} 秒），可能是预览源，请换线路重试"
+            )
+        }
 
         val partial = ensurePartialFile(current)
+        val hlsDir = hlsPackageDir(current.id).apply {
+            if (exists()) deleteRecursively()
+            mkdirs()
+        }
         current = current.copy(
             partialPath = partial.absolutePath,
             hlsSegmentTotal = segments.size,
@@ -320,15 +329,24 @@ class ResumableDownloadEngine(
             partial.delete()
         }
 
-        downloadHlsParallel(current, partial, media, shouldAbort) { updated ->
+        downloadHlsParallel(current, partial, hlsDir, media, shouldAbort) { updated ->
             current = updated
             onProgress(current)
         }
 
+        writeLocalHlsPlaylist(hlsDir, media)
+
         // fMP4 HLS (EXT-X-MAP) is an MP4 container; classic HLS is MPEG-TS.
         val hlsMime = if (media.initUrl != null) "video/mp4" else "video/mp2t"
-        val outputUri = publishFinal(partial, current.fileName, current.treeUri, hlsMime)
-        // Keep partial for in-flight 边下边播 readers; cleaned on restart/cancel.
+        val durationMs = (media.totalDurationSec * 1000.0).toLong().coerceAtLeast(0L)
+        val outputUri = publishFinal(
+            partial = partial,
+            fileName = current.fileName,
+            treeUri = current.treeUri,
+            mime = hlsMime,
+            durationMs = durationMs
+        )
+        // Keep partial for legacy readers; playback prefers local HLS package (index.m3u8).
         return current.copy(
             status = DownloadStatus.COMPLETED,
             outputUri = outputUri.toString(),
@@ -341,13 +359,47 @@ class ResumableDownloadEngine(
         )
     }
 
+    fun hlsPackageDir(taskId: Long): File {
+        return File(context.filesDir, "hls_downloads/$taskId")
+    }
+
+    private fun writeLocalHlsPlaylist(hlsDir: File, media: HlsMedia) {
+        // Segments are stored already decrypted, so no EXT-X-KEY is needed.
+        val targetDuration = media.segments.maxOfOrNull { it.durationSec }?.let {
+            kotlin.math.ceil(it).toInt().coerceAtLeast(1)
+        } ?: 8
+        val sb = StringBuilder()
+        sb.appendLine("#EXTM3U")
+        sb.appendLine("#EXT-X-VERSION:3")
+        sb.appendLine("#EXT-X-PLAYLIST-TYPE:VOD")
+        sb.appendLine("#EXT-X-TARGETDURATION:$targetDuration")
+        sb.appendLine("#EXT-X-MEDIA-SEQUENCE:0")
+        if (media.initUrl != null && File(hlsDir, "init.mp4").exists()) {
+            sb.appendLine("#EXT-X-MAP:URI=\"init.mp4\"")
+        }
+        media.segments.forEachIndexed { index, seg ->
+            if (seg.discontinuityBefore) {
+                sb.appendLine("#EXT-X-DISCONTINUITY")
+            }
+            sb.appendLine("#EXTINF:${String.format(java.util.Locale.US, "%.3f", seg.durationSec)},")
+            sb.appendLine(segmentFileName(index))
+        }
+        sb.appendLine("#EXT-X-ENDLIST")
+        File(hlsDir, "index.m3u8").writeText(sb.toString(), Charsets.UTF_8)
+    }
+
+    private fun segmentFileName(index: Int): String =
+        "seg_%05d.ts".format(index)
+
     /**
      * Fetch several HLS segments concurrently into temp files, then append in order
-     * so the growing partial stays sequentially readable for 边下边播.
+     * so the growing partial stays sequentially readable. Also persist each segment into
+     * [hlsDir] for local m3u8 playback (concatenated .ts often stops ~17s at discontinuities).
      */
     private fun downloadHlsParallel(
         task: DownloadTaskEntity,
         partial: File,
+        hlsDir: File,
         media: HlsMedia,
         shouldAbort: () -> Boolean,
         onProgress: (DownloadTaskEntity) -> Unit
@@ -371,6 +423,7 @@ class ResumableDownloadEngine(
                 if (startIndex == 0 && media.initUrl != null) {
                     checkAbort(shouldAbort)
                     val initBytes = http.getBytes(media.initUrl, referer)
+                    File(hlsDir, "init.mp4").writeBytes(initBytes)
                     output.write(initBytes)
                     output.flush()
                 }
@@ -426,6 +479,8 @@ class ResumableDownloadEngine(
 
                     val segFile = ready.remove(nextToWrite)
                         ?: throw IllegalStateException("分片缺失 index=$nextToWrite")
+                    // Keep a durable copy for local HLS playback.
+                    segFile.copyTo(File(hlsDir, segmentFileName(nextToWrite)), overwrite = true)
                     FileInputStream(segFile).use { input -> input.copyTo(output) }
                     output.flush()
                     segFile.delete()
@@ -450,10 +505,11 @@ class ResumableDownloadEngine(
         partial: File,
         fileName: String,
         treeUri: String,
-        mime: String
+        mime: String,
+        durationMs: Long = -1L
     ): Uri {
         // Always index into MediaStore so home library can discover the file.
-        val mediaStoreUri = publishToMediaStore(partial, fileName, mime)
+        val mediaStoreUri = publishToMediaStore(partial, fileName, mime, durationMs)
 
         if (treeUri.isNotBlank()) {
             try {
@@ -474,7 +530,12 @@ class ResumableDownloadEngine(
         return mediaStoreUri
     }
 
-    private fun publishToMediaStore(partial: File, fileName: String, mime: String): Uri {
+    private fun publishToMediaStore(
+        partial: File,
+        fileName: String,
+        mime: String,
+        durationMs: Long = -1L
+    ): Uri {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
@@ -493,10 +554,13 @@ class ResumableDownloadEngine(
                 if (out == null) throw IllegalStateException("无法写入媒体库")
                 FileInputStream(partial).use { input -> input.copyTo(out) }
             }
+            val probed = durationMs.takeIf { it > 0L } ?: probeDurationMs(uri)
             val meta = ContentValues().apply {
                 put(MediaStore.Video.Media.IS_PENDING, 0)
                 put(MediaStore.Video.Media.SIZE, partial.length())
-                probeDurationMs(uri)?.let { put(MediaStore.Video.Media.DURATION, it) }
+                if (probed != null && probed > 0L) {
+                    put(MediaStore.Video.Media.DURATION, probed)
+                }
             }
             resolver.update(uri, meta, null, null)
             return uri
@@ -584,13 +648,17 @@ class ResumableDownloadEngine(
     private data class HlsSeg(
         val url: String,
         val keyUri: String?,
-        val iv: ByteArray?
+        val iv: ByteArray?,
+        val durationSec: Double,
+        val discontinuityBefore: Boolean
     )
 
     private data class HlsMedia(
         val initUrl: String?,
         val segments: List<HlsSeg>
-    )
+    ) {
+        val totalDurationSec: Double get() = segments.sumOf { it.durationSec }
+    }
 
     /**
      * Parse a media playlist, resolving AES-128 encryption keys/IVs and the optional fMP4
@@ -602,6 +670,8 @@ class ResumableDownloadEngine(
         var curKeyUri: String? = null
         var curKeyIvHex: String? = null
         var initUrl: String? = null
+        var pendingDuration = 0.0
+        var pendingDisc = false
         val segs = ArrayList<HlsSeg>()
 
         playlist.lines().map { it.trim() }.forEach { line ->
@@ -609,6 +679,13 @@ class ResumableDownloadEngine(
                 line.isEmpty() -> Unit
                 line.startsWith("#EXT-X-MEDIA-SEQUENCE:") -> {
                     seq = line.substringAfter(':').trim().toLongOrNull() ?: 0L
+                }
+                line.startsWith("#EXTINF:") -> {
+                    pendingDuration = line.substringAfter(':').substringBefore(',')
+                        .toDoubleOrNull() ?: 0.0
+                }
+                line.startsWith("#EXT-X-DISCONTINUITY") -> {
+                    pendingDisc = true
                 }
                 line.startsWith("#EXT-X-KEY:") -> {
                     val method = attr(line, "METHOD")?.uppercase()
@@ -632,7 +709,15 @@ class ResumableDownloadEngine(
                     } else {
                         null
                     }
-                    segs += HlsSeg(url, keyUri, iv)
+                    segs += HlsSeg(
+                        url = url,
+                        keyUri = keyUri,
+                        iv = iv,
+                        durationSec = pendingDuration,
+                        discontinuityBefore = pendingDisc
+                    )
+                    pendingDuration = 0.0
+                    pendingDisc = false
                     seq++
                 }
             }

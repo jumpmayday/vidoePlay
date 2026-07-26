@@ -13,6 +13,8 @@ import java.io.OutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
+import java.net.URI
+import java.net.URLEncoder
 
 /**
  * HTTP client that can pass simple JS cookie gates and Volcano Engine UA challenges
@@ -85,8 +87,9 @@ class ChallengedHttpClient(
         endByte: Long? = null,
         onBytes: ((Long, Long?) -> Unit)? = null
     ): CopyResult {
+        val safeUrl = sanitizeUrl(url) ?: throw IllegalStateException("非法 URL")
         val builder = Request.Builder()
-            .url(url)
+            .url(safeUrl)
             .header("User-Agent", USER_AGENT)
             .header("Accept", "*/*")
         if (!referer.isNullOrBlank()) {
@@ -151,8 +154,9 @@ class ChallengedHttpClient(
 
     /** Probe total size via Range probe (works on most CDNs that ignore HEAD). */
     fun probeContentLength(url: String, referer: String? = null): Long? {
+        val safeUrl = sanitizeUrl(url) ?: return null
         val builder = Request.Builder()
-            .url(url)
+            .url(safeUrl)
             .header("User-Agent", USER_AGENT)
             .header("Accept", "*/*")
             .header("Range", "bytes=0-0")
@@ -183,8 +187,9 @@ class ChallengedHttpClient(
         if (url.isBlank() || (!url.startsWith("http://") && !url.startsWith("https://"))) {
             return false
         }
+        val safeUrl = sanitizeUrl(url) ?: return false
         val builder = Request.Builder()
-            .url(url)
+            .url(safeUrl)
             .header("User-Agent", USER_AGENT)
             .header("Accept", "*/*")
             .header("Range", "bytes=0-2047")
@@ -208,6 +213,64 @@ class ChallengedHttpClient(
         }
     }
 
+    /**
+     * Resolve master→media playlist and sum #EXTINF durations.
+     * Returns 0 when unreachable / empty.
+     */
+    fun probeHlsDurationSec(url: String, referer: String? = null): Double {
+        return try {
+            var playlistUrl = url
+            var text = getText(playlistUrl, referer)
+            if (text.contains("#EXT-X-STREAM-INF")) {
+                var best: String? = null
+                var bestBw = -1
+                var pending = 0
+                text.lineSequence().map { it.trim() }.forEach { line ->
+                    if (line.startsWith("#EXT-X-STREAM-INF")) {
+                        pending = Regex("""BANDWIDTH=(\d+)""")
+                            .find(line)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+                    } else if (line.isNotEmpty() && !line.startsWith("#")) {
+                        if (pending >= bestBw) {
+                            bestBw = pending
+                            best = absolutize(playlistUrl, line)
+                        }
+                        pending = 0
+                    }
+                }
+                playlistUrl = best ?: return 0.0
+                text = getText(playlistUrl, referer)
+            }
+            var total = 0.0
+            var segs = 0
+            text.lineSequence().forEach { raw ->
+                val line = raw.trim()
+                if (line.startsWith("#EXTINF:")) {
+                    val num = line.substringAfter(':').substringBefore(',').toDoubleOrNull()
+                    if (num != null) {
+                        total += num
+                        segs++
+                    }
+                }
+            }
+            if (segs < 3) 0.0 else total
+        } catch (_: Exception) {
+            0.0
+        }
+    }
+
+    private fun absolutize(baseUrl: String, href: String): String {
+        val cleaned = href.trim()
+        if (cleaned.startsWith("http://") || cleaned.startsWith("https://")) return cleaned
+        val uri = URI(baseUrl)
+        val scheme = uri.scheme ?: "https"
+        val host = uri.host ?: return cleaned
+        return when {
+            cleaned.startsWith("//") -> "$scheme:$cleaned"
+            cleaned.startsWith("/") -> "$scheme://$host$cleaned"
+            else -> baseUrl.substringBeforeLast('/') + "/" + cleaned
+        }
+    }
+
     private val probeClient: OkHttpClient by lazy {
         client.newBuilder()
             .connectTimeout(6, TimeUnit.SECONDS)
@@ -218,8 +281,9 @@ class ChallengedHttpClient(
     }
 
     fun getText(url: String, referer: String? = null): String {
+        val safeUrl = sanitizeUrl(url) ?: throw IllegalStateException("非法 URL")
         val builder = Request.Builder()
-            .url(url)
+            .url(safeUrl)
             .header("User-Agent", USER_AGENT)
             .header("Accept", "*/*")
         if (!referer.isNullOrBlank()) {
@@ -235,8 +299,9 @@ class ChallengedHttpClient(
 
     /** Fetch raw bytes (used for HLS AES-128 keys / small segments). */
     fun getBytes(url: String, referer: String? = null): ByteArray {
+        val safeUrl = sanitizeUrl(url) ?: throw IllegalStateException("非法 URL")
         val builder = Request.Builder()
-            .url(url)
+            .url(safeUrl)
             .header("User-Agent", USER_AGENT)
             .header("Accept", "*/*")
         if (!referer.isNullOrBlank()) {
@@ -247,6 +312,42 @@ class ChallengedHttpClient(
                 throw IllegalStateException("请求失败 HTTP ${response.code}")
             }
             return response.body?.bytes() ?: ByteArray(0)
+        }
+    }
+
+    /**
+     * Percent-encode non-ASCII path segments (e.g. 第01集) so CDNs accept the URL.
+     * Already-encoded `%XX` sequences are left intact.
+     */
+    fun sanitizeUrl(url: String): HttpUrl? {
+        val trimmed = url.trim()
+        if (trimmed.isEmpty()) return null
+        trimmed.toHttpUrlOrNull()?.let { return it }
+        return try {
+            val uri = URI(trimmed)
+            val rawPath = uri.rawPath ?: "/"
+            val encodedPath = rawPath.split("/")
+                .joinToString("/") { seg ->
+                    if (seg.isEmpty()) {
+                        ""
+                    } else if (seg.any { it > 0x7F.toChar() }) {
+                        // Encode each raw segment; keep already-escaped sequences by decoding first.
+                        URLEncoder.encode(seg, Charsets.UTF_8.name())
+                            .replace("+", "%20")
+                    } else {
+                        seg
+                    }
+                }
+            val rebuilt = URI(
+                uri.scheme,
+                uri.rawAuthority,
+                encodedPath,
+                uri.rawQuery,
+                uri.rawFragment
+            ).toString()
+            rebuilt.toHttpUrlOrNull()
+        } catch (_: Exception) {
+            null
         }
     }
 

@@ -130,8 +130,19 @@ class VideoRepository(
         val existingUris = scanned.map { it.uri }.toHashSet()
         val existingNames = scanned.map { it.displayName.lowercase() }.toHashSet()
         val extras = completed.mapNotNull { task ->
-            if (task.outputUri.isBlank()) return@mapNotNull null
-            if (task.outputUri in existingUris) return@mapNotNull null
+            if (task.outputUri.isBlank() && !task.isHls) return@mapNotNull null
+            val localHls = if (task.isHls) {
+                DownloadPlayback.hlsIndexFile(appContext, task.id)
+            } else {
+                null
+            }
+            val playUri = when {
+                localHls != null && localHls.exists() ->
+                    android.net.Uri.fromFile(localHls).toString()
+                task.outputUri.isNotBlank() -> task.outputUri
+                else -> return@mapNotNull null
+            }
+            if (playUri in existingUris) return@mapNotNull null
             val name = task.title.ifBlank { task.fileName }
             // Avoid duplicate cards when MediaStore already indexed same file under another URI.
             if (name.lowercase() in existingNames &&
@@ -144,7 +155,7 @@ class VideoRepository(
             }
             VideoItem(
                 id = -task.id,
-                uri = task.outputUri,
+                uri = playUri,
                 path = DownloadPlayback.pathFor(task.id),
                 displayName = name,
                 folderName = DownloadPlayback.FOLDER_NAME,
@@ -153,7 +164,11 @@ class VideoRepository(
                 sizeBytes = task.downloadedBytes.coerceAtLeast(0L),
                 width = 0,
                 height = 0,
-                mimeType = if (task.isHls) "video/mp2t" else "video/mp4",
+                mimeType = when {
+                    playUri.contains(".m3u8", true) -> "application/x-mpegURL"
+                    task.isHls -> "video/mp2t"
+                    else -> "video/mp4"
+                },
                 dateModified = task.updatedAt
             )
         }

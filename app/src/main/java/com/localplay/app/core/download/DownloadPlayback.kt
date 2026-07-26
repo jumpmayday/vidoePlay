@@ -29,6 +29,9 @@ object DownloadPlayback {
 
     fun mediaUrlFor(path: String): String? = mediaUrlByPath[path]
 
+    fun hlsIndexFile(context: Context, taskId: Long): File =
+        File(context.applicationContext.filesDir, "hls_downloads/$taskId/index.m3u8")
+
     fun canPlayWhileDownloading(task: DownloadTaskEntity): Boolean {
         return when (task.status) {
             DownloadStatus.RUNNING, DownloadStatus.PAUSED, DownloadStatus.QUEUED ->
@@ -40,14 +43,24 @@ object DownloadPlayback {
     }
 
     /**
-     * Incomplete: prefer local growing partial (边下边播追文件增长);
-     * if partial too small, fall back to remote mediaUrl.
-     * Completed: prefer MediaStore / outputUri.
+     * HLS: always prefer local decrypted m3u8 package (handles discontinuities).
+     * While downloading HLS, stream the remote playlist instead of the growing concat
+     * (concatenated .ts often stops around the first PCR break ~17s).
+     * Progressive: prefer local growing partial when large enough.
      */
     fun resolvePlayUri(context: Context, task: DownloadTaskEntity): String {
         val path = pathFor(task.id)
         mediaUrlByPath[path] = task.mediaUrl
         growingFileByPath.remove(path)
+
+        if (task.isHls) {
+            val index = hlsIndexFile(context, task.id)
+            if (index.exists() && index.length() > 0L) {
+                return UriFile.asUri(index)
+            }
+            // In-progress / incomplete: play remote HLS (ExoPlayer handles discontinuities).
+            return task.mediaUrl
+        }
 
         if (task.status == DownloadStatus.COMPLETED && task.outputUri.isNotBlank()) {
             return task.outputUri
@@ -56,11 +69,9 @@ object DownloadPlayback {
         val partial = task.partialPath.takeIf { it.isNotBlank() }?.let { File(it) }
         if (partial != null && partial.exists() && partial.length() >= MIN_PARTIAL_BYTES) {
             growingFileByPath[path] = partial
-            // File path for GrowingFileDataSource (not FileProvider content uri)
             return UriFile.asUri(partial)
         }
 
-        // No local bytes yet — stream remote while download catches up / starts writing.
         return task.mediaUrl
     }
 
@@ -69,6 +80,8 @@ object DownloadPlayback {
         refererOf(task)?.let { refererByPath[path] = it }
         val playUri = resolvePlayUri(context, task)
         val growing = growingFileByPath.containsKey(path)
+        val localHls = task.isHls && playUri.contains(".m3u8", ignoreCase = true) &&
+            !playUri.startsWith("http")
         return VideoItem(
             id = -task.id,
             uri = playUri,
@@ -81,8 +94,10 @@ object DownloadPlayback {
             width = 0,
             height = 0,
             mimeType = when {
-                growing -> "video/mp4" // container probed from stream; TS also ok via extractor
-                task.isHls || playUri.contains(".m3u8", true) -> "application/x-mpegURL"
+                localHls || (task.isHls && playUri.contains(".m3u8", true)) ->
+                    "application/x-mpegURL"
+                growing -> "video/mp4"
+                task.isHls -> "video/mp2t"
                 playUri.contains(".webm", true) -> "video/webm"
                 else -> "video/mp4"
             },

@@ -449,6 +449,11 @@ class VideoSniffer(
                     ok = false
                 )
                 val ok = http.probeMediaOk(parsed.first, sample.playUrl)
+                val durationOk = if (ok && parsed.first.contains(".m3u8", ignoreCase = true)) {
+                    http.probeHlsDurationSec(parsed.first, sample.playUrl) >= MIN_HLS_DURATION_SEC
+                } else {
+                    ok
+                }
                 Probe(
                     sourceIndex = index,
                     sourceName = sample.sourceName,
@@ -456,7 +461,7 @@ class VideoSniffer(
                     sample = sample,
                     mediaUrl = parsed.first,
                     from = parsed.second,
-                    ok = ok
+                    ok = durationOk
                 )
             } catch (e: Exception) {
                 Log.i(TAG, "probe source ${sample.sourceName} failed: ${e.message}")
@@ -478,9 +483,12 @@ class VideoSniffer(
             return emptyList()
         }
 
-        val best = good.firstOrNull { it.preferred }
-            ?: good.maxByOrNull { scoreSource(it.from, it.mediaUrl) }
-            ?: good.first()
+        val best = good.maxByOrNull { score ->
+            var s = scoreSource(score.from, score.mediaUrl)
+            // Prefer marked tab only when it also scored well; dead "this" lines (bfzy 404) lose.
+            if (score.preferred) s += 5
+            s
+        } ?: good.first()
 
         onStatus("选用线路「${best.sourceName}」，解析分集…")
         val selectedEps = bySource[best.sourceIndex]
@@ -568,9 +576,14 @@ class VideoSniffer(
         val f = from.lowercase()
         val u = mediaUrl.lowercase()
         if (f.contains("1080") || u.contains("1080")) score += 30
-        if (f.contains("zy") || f.contains("zuida") || f.contains("wj") || f.contains("ff")) score += 10
+        if (f.contains("ff") || f.contains("wj") || f.contains("zuida")) score += 15
+        if (f.contains("zy") && !f.contains("bfzy")) score += 10
         if (u.contains(".m3u8")) score += 5
-        if (u.contains("404") || f.contains("bfzy") || f.contains("lz")) score -= 5
+        // 暴风源 often uses Chinese path segments that 404; demote hard.
+        if (f.contains("bfzy") || u.contains("rrcdnbf") || u.contains("bfzy")) score -= 40
+        if (u.contains("404") || f.contains("lz")) score -= 10
+        // Non-ASCII path frequently breaks on some CDNs.
+        if (mediaUrl.any { it.code > 0x7F }) score -= 8
         return score
     }
 
@@ -900,6 +913,8 @@ class VideoSniffer(
     companion object {
         private const val TAG = "VideoSniffer"
         private const val SNIFF_PARALLEL = 6
+        /** Reject preview / broken HLS variants under ~1 minute. */
+        private const val MIN_HLS_DURATION_SEC = 60.0
         private val MEDIA_EXT = listOf(".m3u8", ".mp4", ".webm", ".mkv", ".flv", ".ts")
 
         private val LIST_TYPE_ID: Pattern = Pattern.compile(
